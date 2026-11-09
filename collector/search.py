@@ -1,11 +1,31 @@
 import asyncio
 import heapq
+import threading
 
 import numpy as np
 from asyncmy.cursors import SSDictCursor
 
 from collector.config import DATA, MODEL
 from collector.vector_index import IndexReader
+
+_MODEL_REGISTRATION_LOCK = threading.Lock()
+
+
+def embedding_model():
+    from fastembed import TextEmbedding
+    from fastembed.common.model_description import ModelSource, PoolingType
+
+    name = MODEL
+    if MODEL == 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2':
+        name = 'tg-message-collector/minilm-mean-v1'
+        with _MODEL_REGISTRATION_LOCK:
+            if not any(m['model'] == name for m in TextEmbedding.list_supported_models()):
+                TextEmbedding.add_custom_model(
+                    model=name, pooling=PoolingType.MEAN, normalization=True,
+                    sources=ModelSource(hf='qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q'),
+                    dim=384, model_file='model_optimized.onnx',
+                )
+    return TextEmbedding(name, cache_dir=str(DATA / 'models'), threads=2)
 
 
 class Encoder:
@@ -15,8 +35,7 @@ class Encoder:
 
     def _encode(self, texts):
         if self.model is None:
-            from fastembed import TextEmbedding
-            self.model = TextEmbedding(MODEL, cache_dir=str(DATA / 'models'), threads=2)
+            self.model = embedding_model()
         vectors = np.asarray(list(self.model.embed(texts)), dtype='<f4')
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         return vectors / np.maximum(norms, 1e-12)
