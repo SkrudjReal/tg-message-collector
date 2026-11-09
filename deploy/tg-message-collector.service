@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram message collector
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT@
+ExecCondition=@PROJECT@/.venv/bin/python -m collector.session_ready
+ExecStart=@PROJECT@/.venv/bin/python app.py run
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

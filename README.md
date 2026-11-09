@@ -1,52 +1,43 @@
-# Pyrogram Userbot Example
+<div align="center">
 
-A clean, async-ready userbot template built with [**Kurigram** (Pyrogram fork)] and [**Dispyro**] for scalable dependency injection.
+# ✦ TG Message Collector
 
-> ⚙️ Kurigram supports the latest MTProto API features. Dispyro adds flexible DI and middleware layers for better architecture.
+Локальный архив Telegram · MySQL 8 · поиск по словам и смыслу · MCP только для чтения
 
+[Запуск](#запуск) · [Возможности](#возможности) · [Документация](docs/operations.md)
 
----
+</div>
 
-## 🚀 Key Features
+## Возможности
 
-- ⚡ **uvloop** — faster event loop (Linux-only)
-- 📦 **Poetry** — modern dependency and virtualenv manager
-- 🐬 **MySQL** via **asyncmy** using repository pattern
-- 🧠 **DBPool middleware** — injects **MySQL + Redis** into context
-- 📝 **Logging** — bot startup, messages, errors
-- 🔁 **pm2** — for process management & production deployment
+| Часть | Реализация |
+| :--- | :--- |
+| Telegram | Kurigram / MTProto, отдельная сессия, новые сообщения и постепенная загрузка истории |
+| Архив | Пользователи и био, чаты, авторы, адресаты личных сообщений, replies, темы, пересылки, метаданные медиа |
+| Изменения | Предыдущий текст правок, отметки наблюдавшихся удалений, защита от дублей |
+| Поиск | Индексы чата/автора/даты, MySQL FULLTEXT, буквальная подстрока, локальные multilingual embeddings |
+| Семантика | HNSW по всему индексу; точный cosine по ограниченной выборке при фильтрах |
+| MCP | `http://127.0.0.1:8765/mcp`, Bearer token, отдельный MySQL-пользователь с `SELECT` |
 
----
+## Запуск
 
-## ⚙️ Installation
-
-```bash
-git clone https://github.com/SkrudjReal/single-pyrouserbot-example.git
-cd single-pyrouserbot-example
-poetry install --no-root
-cp settings.env.example settings.env  # Create and edit environment config
-```
-
-## Start
-
-## Development
+На этой машине база, `.env`, зависимости, модель и пользовательские systemd units уже подготовлены.
+Для первой авторизации в интерактивном терминале:
 
 ```bash
-poetry run python3 app.py
+cd /home/velunae/projects/mainstream/tg-message-collector
+.venv/bin/python app.py login
+systemctl --user start tg-message-collector
+systemctl --user status tg-message-collector tg-message-collector-mcp
 ```
 
-## Production via pm2
+Код Telegram и 2FA вводятся только в терминале. По умолчанию собираются все доступные диалоги;
+`CHAT_IDS` в `.env` ограничивает их список. За цикл загружается до 1000 старых сообщений на чат,
+каждые пять минут процесс продолжает загрузку глубже. Новые сообщения принимаются одновременно.
 
-# With ecosystem file
-```bash
-pm2 start ecosystem.config.js
-pm2 save && pm2 startup
-```
+[MCP, индексы, ограничения, тесты и установка на другом хосте →](docs/operations.md)
 
-# or manually
-```bash
-pm2 start "poetry run python3 app.py" --name "pyrogram-example"
-pm2 save && pm2 startup
-```
-
-You are amazing.
+Основа: [SkrudjReal/single-pyrouserbot-example](https://github.com/SkrudjReal/single-pyrouserbot-example),
+commit `549dc7b`. Удалены неиспользуемые demo ping / Redis / scheduler;
+сохранены Kurigram, асинхронный MySQL и точка входа `app.py`. Исходный remote сохранён как `template`.
+Новый GitHub-репозиторий пока не опубликован.

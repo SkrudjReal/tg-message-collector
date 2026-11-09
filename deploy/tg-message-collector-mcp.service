@@ -1,0 +1,16 @@
+[Unit]
+Description=Read-only Telegram archive MCP (localhost)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT@
+ExecStart=@PROJECT@/.venv/bin/python -m collector.mcp_server
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
