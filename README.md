@@ -26,12 +26,14 @@
 
 ```bash
 cd /home/velunae/projects/mainstream/tg-message-collector
-.venv/bin/python app.py login
+.venv/bin/python app.py login-qr
 systemctl --user start tg-message-collector
 systemctl --user status tg-message-collector tg-message-collector-mcp
 ```
 
-Код Telegram и 2FA вводятся только в терминале. По умолчанию собираются все доступные диалоги;
+QR сканируется в Telegram на телефоне: Настройки → Устройства → Подключить устройство.
+Если включена 2FA, пароль вводится только в терминале. Обычный вход по коду: `app.py login`.
+По умолчанию собираются все доступные диалоги;
 `CHAT_IDS` в `.env` ограничивает их список. За цикл загружается до 1000 старых сообщений на чат,
 каждые пять минут процесс продолжает загрузку глубже. Новые сообщения принимаются одновременно.
 

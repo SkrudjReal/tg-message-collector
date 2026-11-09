@@ -149,11 +149,14 @@ async def run(args):
         finally:
             await store.close()
         return
-    app = client(interactive=args.command == 'login')
-    if args.command == 'login':
-        async with app:
+    app = client(interactive=args.command in ('login', 'login-qr'))
+    if args.command in ('login', 'login-qr'):
+        await app.start(use_qr=args.command == 'login-qr')
+        try:
             me = await app.get_me()
             log.info('Telegram session authorized for user %s', me.id)
+        finally:
+            await app.stop()
         return
     if not (DATA / 'collector.session').exists():
         raise RuntimeError('Run .venv/bin/python app.py login in an interactive terminal first')
@@ -208,7 +211,7 @@ def main():
     except BlockingIOError:
         raise SystemExit('Another collector/login/embedding process is already running') from None
     parser = argparse.ArgumentParser(description='Telegram message collector')
-    parser.add_argument('command', choices=['login', 'run', 'embed'], nargs='?', default='run')
+    parser.add_argument('command', choices=['login', 'login-qr', 'run', 'embed'], nargs='?', default='run')
     parser.add_argument('--history-limit', type=int, default=int(os.getenv('HISTORY_LIMIT', '1000')),
                         help='Older messages per chat per 5-minute cycle; 0 means all')
     parser.add_argument('--once', action='store_true', help='Drain the embedding backlog and exit')

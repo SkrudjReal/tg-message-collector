@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Telegram archive with MySQL, multilingual search and a read-only local MCP server"
 requires-python = ">=3.12,<3.15"
 dependencies = [
-    "kurigram>=2.2.7,<3",
+    "kurigram[qrcode]>=2.2.7,<3",
     "tgcrypto>=1.2.5,<2",
     "asyncmy>=0.2.10,<0.3",
     "mcp>=1.20,<2",
