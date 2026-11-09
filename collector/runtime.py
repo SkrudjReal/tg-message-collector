@@ -34,20 +34,38 @@ def client(interactive=False):
                   fetch_replies=False, fetch_topics=False, fetch_stories=False, fetch_stickers=False)
 
 
+async def fetch_bio(app, user_id):
+    # Avoid get_chat's full Chat parser, which can also fetch pinned/channel messages.
+    peer = await app.resolve_peer(user_id)
+    if isinstance(peer, raw.types.InputPeerUser):
+        peer = raw.types.InputUser(user_id=peer.user_id, access_hash=peer.access_hash)
+    elif isinstance(peer, raw.types.InputPeerSelf):
+        peer = raw.types.InputUserSelf()
+    else:
+        raise ValueError('Profile lookup requires a user peer')
+    result = await app.invoke(raw.functions.users.GetFullUser(id=peer))
+    if not isinstance(result, raw.types.users.UserFull) or result.full_user.id != user_id:
+        raise ValueError('Unexpected user profile response')
+    return result.full_user.about or None
+
+
 async def profile_loop(app, store, queue, pending):
     # Event-driven enrichment only: no dialog scan or daily profile polling.
     while True:
         user_id = await queue.get()
         retry = False
         try:
-            full = await app.get_chat(user_id)
-            await store.save_bio(user_id, full.bio)
+            bio = await fetch_bio(app, user_id)
+            await store.save_bio(user_id, bio)
         except FloodWait as exc:
             await report_error(store, 'profile', exc, user_id=user_id)
             await asyncio.sleep(exc.value + 1)
             retry = True
         except RPCError as exc:
             await store.execute('UPDATE users SET bio_checked_at=UTC_TIMESTAMP(6) WHERE user_id=%s', (user_id,))
+            await report_error(store, 'profile', exc, user_id=user_id)
+        except Exception as exc:
+            # One malformed/unavailable profile must not restart the whole queue.
             await report_error(store, 'profile', exc, user_id=user_id)
         finally:
             queue.task_done()

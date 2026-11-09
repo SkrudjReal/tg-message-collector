@@ -7,7 +7,7 @@ from pyrogram import enums, raw
 from pyrogram.handlers import EditedMessageHandler, MessageHandler, RawUpdateHandler
 from pyrogram.types import Chat, Message
 
-from collector.runtime import handle_raw_update, profile_loop, run
+from collector.runtime import fetch_bio, handle_raw_update, profile_loop, run
 
 
 CHATS = [Chat(id=identifier, type=kind) for identifier, kind in (
@@ -101,21 +101,58 @@ class ChatScopeTests(unittest.IsolatedAsyncioTestCase):
         queue.assert_not_called()
 
     async def test_profile_worker_does_not_poll_users_when_queue_is_empty(self):
-        app = SimpleNamespace(get_chat=AsyncMock(return_value=SimpleNamespace(bio='observed bio')))
+        result = raw.types.users.UserFull(full_user=raw.types.UserFull(
+            id=123, settings=raw.types.PeerSettings(), notify_settings=raw.types.PeerNotifySettings(),
+            common_chats_count=0, about='observed bio', pinned_msg_id=77, personal_channel_id=456,
+            personal_channel_message=88), users=[], chats=[])
+        app = SimpleNamespace(resolve_peer=AsyncMock(return_value=raw.types.InputPeerUser(user_id=123, access_hash=1)),
+                              invoke=AsyncMock(return_value=result), get_chat=AsyncMock(), get_messages=AsyncMock())
         store = SimpleNamespace(save_bio=AsyncMock())
         queue, pending = asyncio.Queue(), {123}
         task = asyncio.create_task(profile_loop(app, store, queue, pending))
         try:
             await asyncio.sleep(0)
             app.get_chat.assert_not_called()
+            app.invoke.assert_not_called()
             queue.put_nowait(123)
             await queue.join()
-            app.get_chat.assert_awaited_once_with(123)
+            app.resolve_peer.assert_awaited_once_with(123)
+            self.assertIsInstance(app.invoke.await_args.args[0], raw.functions.users.GetFullUser)
+            app.get_chat.assert_not_called()
+            app.get_messages.assert_not_called()
             store.save_bio.assert_awaited_once_with(123, 'observed bio')
             self.assertEqual(pending, set())
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+    async def test_bad_profile_does_not_abort_the_next_profile_or_erase_bio(self):
+        queue, pending = asyncio.Queue(), {123, 456}
+        for user_id in (123, 456):
+            queue.put_nowait(user_id)
+        store = SimpleNamespace(save_bio=AsyncMock(), record_error=AsyncMock())
+
+        async def no_delay(_):
+            pass
+
+        with patch('collector.runtime.fetch_bio', new=AsyncMock(side_effect=[AttributeError('bad'), 'good bio'])), \
+             patch('collector.runtime.asyncio.sleep', new=no_delay):
+            task = asyncio.create_task(profile_loop(None, store, queue, pending))
+            try:
+                await asyncio.wait_for(queue.join(), timeout=2)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        store.save_bio.assert_awaited_once_with(456, 'good bio')
+        self.assertEqual(store.record_error.await_args.args[0], 'profile')
+        self.assertEqual(store.record_error.await_args.kwargs['user_id'], 123)
+        self.assertEqual(pending, set())
+
+    async def test_invalid_full_profile_is_not_treated_as_an_empty_bio(self):
+        app = SimpleNamespace(resolve_peer=AsyncMock(return_value=raw.types.InputPeerUser(user_id=123, access_hash=1)),
+                              invoke=AsyncMock(return_value=None))
+        with self.assertRaises(ValueError):
+            await fetch_bio(app, 123)
 
     async def test_raw_forward_and_reaction_updates_preserve_received_counts(self):
         store = SimpleNamespace(query=AsyncMock(return_value=[{'type': 'channel'}]),
