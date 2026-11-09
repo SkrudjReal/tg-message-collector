@@ -3,9 +3,9 @@ import asyncio
 import logging
 import os
 
-from pyrogram import Client, idle
+from pyrogram import Client, enums, filters, idle
 from pyrogram.errors import FloodWait, RPCError
-from pyrogram.handlers import MessageHandler, EditedMessageHandler, DeletedMessagesHandler
+from pyrogram.handlers import MessageHandler, EditedMessageHandler
 
 from collector.config import DATA, MODEL, chat_ids
 from collector.storage import Store
@@ -13,6 +13,12 @@ from collector.search import Encoder
 from collector.vector_index import IndexWriter
 
 log = logging.getLogger('collector')
+
+
+def archive_chat(chat):
+    return bool(chat and chat.type in {
+        enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.FORUM, enums.ChatType.CHANNEL,
+    })
 
 
 class AuthorizedClient(Client):
@@ -66,11 +72,16 @@ async def history_loop(app, store, own_id, history_limit):
             else:
                 ids = []
                 async for dialog in app.get_dialogs():
+                    if not archive_chat(dialog.chat):
+                        continue
                     await store.save_chat(dialog.chat)
                     ids.append(dialog.chat.id)
             for chat_id in ids:
                 try:
-                    await store.save_chat(await app.get_chat(chat_id), details=True)
+                    chat = await app.get_chat(chat_id)
+                    if not archive_chat(chat):
+                        continue
+                    await store.save_chat(chat, details=True)
                     await sync_chat(app, store, chat_id, own_id, history_limit)
                 except FloodWait as exc:
                     log.warning('History FloodWait: %ss', exc.value)
@@ -110,7 +121,7 @@ async def embedding_loop(store, once=False):
     while True:
         rows = await store.query('SELECT m.archive_id,m.text,m.text_hash FROM messages m '
                                  'LEFT JOIN message_embeddings e ON e.archive_id=m.archive_id '
-                                 "WHERE m.text<>'' AND m.deleted_at IS NULL "
+                                 "WHERE m.text<>'' "
                                  'AND (e.archive_id IS NULL OR e.text_hash<>m.text_hash OR e.model<>%s) '
                                  'ORDER BY m.archive_id LIMIT 64', (MODEL,))
         if not rows:
@@ -167,21 +178,15 @@ async def run(args):
 
     async def on_message(_, msg):
         await ready.wait()
-        if msg.chat and (not allowed or msg.chat.id in allowed):
+        if archive_chat(msg.chat) and (not allowed or msg.chat.id in allowed):
             try:
                 await store.save_message(msg, own_id)
             except Exception as exc:
                 log.error('Message archive failed (%s); history sync will retry persisted messages', type(exc).__name__)
 
-    async def on_delete(_, messages):
-        try:
-            await store.mark_deleted(messages, allowed)
-        except Exception as exc:
-            log.error('Deletion update failed (%s)', type(exc).__name__)
-
-    app.add_handler(MessageHandler(on_message))
-    app.add_handler(EditedMessageHandler(on_message))
-    app.add_handler(DeletedMessagesHandler(on_delete))
+    scope = filters.group | filters.channel
+    app.add_handler(MessageHandler(on_message, scope))
+    app.add_handler(EditedMessageHandler(on_message, scope))
     tasks = []
     try:
         await app.start()
@@ -218,6 +223,6 @@ def main():
     args = parser.parse_args()
     if args.history_limit < 0:
         parser.error('--history-limit must be >=0')
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     logging.getLogger('asyncmy').setLevel(logging.ERROR)
     asyncio.run(run(args))

@@ -45,8 +45,7 @@ class Encoder:
             return await asyncio.to_thread(self._encode, texts)
 
 
-def filters(chat_id=None, sender_user_id=None, sender_chat_id=None, since=None, until=None,
-            include_deleted=False, topic_id=None):
+def filters(chat_id=None, sender_user_id=None, sender_chat_id=None, since=None, until=None, topic_id=None):
     clauses, params = [], []
     for name, value, op in [('chat_id', chat_id, '='), ('sender_user_id', sender_user_id, '='),
                             ('sender_chat_id', sender_chat_id, '='), ('sent_at', since, '>='),
@@ -54,8 +53,6 @@ def filters(chat_id=None, sender_user_id=None, sender_chat_id=None, since=None, 
         if value is not None:
             clauses.append(f'm.{name}{op}%s')
             params.append(value)
-    if not include_deleted:
-        clauses.append('m.deleted_at IS NULL')
     return clauses, params
 
 
@@ -138,10 +135,10 @@ class Search:
             return dict(messages=[], scanned=0, truncated=False,
                         note='No current embeddings match. Run the embedding worker and check archive_status.')
         ids = [item[1] for item in ranked]
-        # Recheck currentness after scoring in case a live edit/delete happened concurrently.
+        # Recheck currentness after scoring in case a live edit happened concurrently.
         rows = await self.store.query('SELECT m.* FROM messages m JOIN message_embeddings e '
                                       'ON e.archive_id=m.archive_id WHERE e.text_hash=m.text_hash '
-                                      'AND m.deleted_at IS NULL AND m.archive_id IN (' +
+                                      'AND m.archive_id IN (' +
                                       ','.join(['%s'] * len(ids)) + ')', tuple(ids))
         by_id = {row['archive_id']: row for row in rows}
         return dict(messages=[dict(by_id[i], similarity=score) for score, i in ranked if i in by_id],
@@ -159,8 +156,8 @@ class Search:
             if not ids:
                 return dict(messages=[], approximate=True, indexed_vectors=size, truncated=False)
             rows = await self.store.query('SELECT m.*,e.vector FROM messages m JOIN message_embeddings e '
-                                          'ON e.archive_id=m.archive_id WHERE m.deleted_at IS NULL '
-                                          'AND e.text_hash=m.text_hash AND e.model=%s AND m.archive_id IN (' +
+                                          'ON e.archive_id=m.archive_id WHERE '
+                                          'e.text_hash=m.text_hash AND e.model=%s AND m.archive_id IN (' +
                                           ','.join(['%s'] * len(ids)) + ')', (MODEL, *ids))
             # Score using current SQL vectors, even if an edit occurred since the ANN snapshot.
             for row in rows:

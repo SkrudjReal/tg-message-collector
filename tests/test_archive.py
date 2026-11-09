@@ -106,15 +106,11 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(seen), 6)
         self.assertEqual(len(set(seen)), 6)
 
-    async def test_deletion_is_not_undone_by_history(self):
+    async def test_legacy_deleted_marker_does_not_hide_archived_message(self):
         await self.writer.save_row(row())
-        msg = SimpleNamespace(chat=SimpleNamespace(id=-10001), id=1)
-        await self.writer.mark_deleted([msg], set())
+        await self.writer.execute('UPDATE messages SET deleted_at=UTC_TIMESTAMP(6)')
         await self.writer.save_row(row())
-        self.assertEqual((await self.search.messages())['messages'], [])
-        self.assertEqual(len((await self.search.messages(include_deleted=True))['messages']), 1)
-        await self.writer.mark_deleted([SimpleNamespace(chat=None, id=1)], set())
-        self.assertEqual(len(await self.reader.query('SELECT * FROM unresolved_deletions')), 1)
+        self.assertEqual(len((await self.search.messages())['messages']), 1)
 
     async def test_real_kurigram_serialization_and_private_recipient(self):
         user = User(id=123, first_name='Tester', username='tester')
@@ -136,6 +132,8 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         await self.writer.save_row(row(text='Нужно починить велосипед, сломалось колесо.'))
         await self.writer.save_row(row(message_id=2, text='Банковский кредит и процентная ставка.'))
         await self.writer.save_row(row(chat_id=-10002, text='Сегодня идет дождь.'))
+        # Telegram deletion/legacy marks must not remove an archived message from either index.
+        await self.writer.execute('UPDATE messages SET deleted_at=UTC_TIMESTAMP(6) WHERE message_id=1 AND chat_id=-10001')
         await embedding_loop(self.writer, once=True)
         result = await self.search.semantic('ремонт двухколесного транспорта', chat_id=-10001)
         self.assertEqual(result['messages'][0]['message_id'], 1)

@@ -152,13 +152,3 @@ class Store:
             except BaseException:
                 await conn.rollback()
                 raise
-
-    async def mark_deleted(self, messages, allowed):
-        for message in messages:
-            chat = message.chat
-            if chat and (not allowed or chat.id in allowed):
-                await self.execute('UPDATE messages SET deleted_at=COALESCE(deleted_at,UTC_TIMESTAMP(6)) '
-                                   'WHERE chat_id=%s AND message_id=%s', (chat.id, message.id))
-            elif not chat:
-                # Private/basic group deletion updates can lack peer information. Never guess a chat.
-                await self.execute('INSERT IGNORE INTO unresolved_deletions (message_id) VALUES (%s)', (message.id,))

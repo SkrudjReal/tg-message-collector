@@ -30,7 +30,7 @@ class IndexWriter:
         async with store.pool.acquire() as conn, conn.cursor(SSDictCursor) as cur:
             await cur.execute('SELECT e.archive_id,e.vector FROM message_embeddings e '
                               'JOIN messages m ON m.archive_id=e.archive_id '
-                              'WHERE e.model=%s AND e.text_hash=m.text_hash AND m.deleted_at IS NULL '
+                              'WHERE e.model=%s AND e.text_hash=m.text_hash '
                               'AND e.updated_at>=%s', (MODEL, self.watermark))
             while rows := await cur.fetchmany(1024):
                 keys = np.asarray([r['archive_id'] for r in rows], dtype=np.uint64)

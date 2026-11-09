@@ -45,7 +45,7 @@ READ = {'readOnlyHint': True, 'destructiveHint': False, 'idempotentHint': True, 
 async def search_messages(query: str | None = None, chat_id: int | None = None,
                           sender_user_id: int | None = None, sender_chat_id: int | None = None,
                           since: datetime | None = None, until: datetime | None = None,
-                          mode: str = 'fulltext', limit: int = 50, include_deleted: bool = False,
+                          mode: str = 'fulltext', limit: int = 50,
                           topic_id: int | None = None, before_date: datetime | None = None,
                           before_chat_id: int | None = None, before_message_id: int | None = None) -> dict:
     """Search by chat/user/date/topic or across all chats. Boolean FULLTEXT: +word, word*, \"phrase\".
@@ -54,7 +54,7 @@ async def search_messages(query: str | None = None, chat_id: int | None = None,
     """
     return await search.messages(query=query, mode=mode, limit=limit, chat_id=chat_id,
                                   sender_user_id=sender_user_id, sender_chat_id=sender_chat_id,
-                                  since=utc(since), until=utc(until), include_deleted=include_deleted,
+                                  since=utc(since), until=utc(until),
                                   topic_id=topic_id, before_date=utc(before_date),
                                   before_chat_id=before_chat_id, before_message_id=before_message_id)
 
@@ -137,11 +137,11 @@ async def archive_status() -> dict:
     counts = {}
     for table in ('users', 'chats', 'messages', 'message_revisions', 'unresolved_deletions'):
         counts[table] = (await store.query(f'SELECT COUNT(*) AS n FROM {table}'))[0]['n']
-    counts['text_messages'] = (await store.query("SELECT COUNT(*) AS n FROM messages WHERE text<>'' AND deleted_at IS NULL"))[0]['n']
+    counts['text_messages'] = (await store.query("SELECT COUNT(*) AS n FROM messages WHERE text<>''"))[0]['n']
     counts['current_embeddings'] = (await store.query('SELECT COUNT(*) AS n FROM message_embeddings e '
                                                       'JOIN messages m ON m.archive_id=e.archive_id '
-                                                      "WHERE e.model=%s AND e.text_hash=m.text_hash AND m.text<>'' "
-                                                      'AND m.deleted_at IS NULL', (MODEL,)))[0]['n']
+                                                      "WHERE e.model=%s AND e.text_hash=m.text_hash AND m.text<>''",
+                                                      (MODEL,)))[0]['n']
     path = index_path()
     return dict(counts=counts, model=MODEL, ann_ready=path.exists(),
                 sync=await store.query('SELECT * FROM chat_sync ORDER BY chat_id LIMIT 200'))
