@@ -125,15 +125,46 @@ async def get_message(chat_id: int, message_id: int, context: int = 5) -> dict:
                                 'ORDER BY message_id LIMIT %s', (chat_id, message_id, context))
     revisions = await store.query('SELECT * FROM message_revisions WHERE chat_id=%s AND message_id=%s '
                                     'ORDER BY revision_id LIMIT 200', (chat_id, message_id))
+    metrics = await store.query('SELECT * FROM message_metrics WHERE chat_id=%s AND message_id=%s',
+                                (chat_id, message_id))
     return dict(message=msg, reply=reply[0] if reply else None,
-                before=list(reversed(before)), after=after, revisions=revisions)
+                before=list(reversed(before)), after=after, revisions=revisions,
+                metrics=metrics[0] if metrics else None)
 
 
 @mcp.tool(annotations=READ)
-async def archive_status() -> dict:
-    """Counts, embedding coverage and per-chat history progress (up to 200 chats).
-    Counts scan indexes; may be slower on large archives. Unresolved deletions lack a reliable peer.
+async def get_user_history(user_id: int, after_snapshot_id: int = 0, limit: int = 50) -> dict:
+    """Observed username, first/last name and bio snapshots. No retrospective Telegram requests.
+    A legacy_baseline is the state retained before history tracking, not reconstructed past changes.
     """
+    bounded_limit(limit)
+    rows = await store.query('SELECT * FROM user_history WHERE user_id=%s AND snapshot_id>%s '
+                              'ORDER BY snapshot_id LIMIT %s', (user_id, after_snapshot_id, limit))
+    return dict(snapshots=rows, next_snapshot_id=rows[-1]['snapshot_id'] if len(rows) == limit else None)
+
+
+@mcp.tool(annotations=READ)
+async def get_message_metrics(chat_id: int, message_id: int, after_snapshot_id: int = 0, limit: int = 50) -> dict:
+    """Observed views/forwards/reaction-count snapshots. Null means not supplied by Telegram.
+    Event-driven only: no scheduled post refresh; absence of a snapshot does not mean zero.
+    """
+    bounded_limit(limit)
+    current = await store.query('SELECT * FROM message_metrics WHERE chat_id=%s AND message_id=%s',
+                                (chat_id, message_id))
+    rows = await store.query('SELECT * FROM message_metric_history WHERE chat_id=%s AND message_id=%s '
+                              'AND snapshot_id>%s ORDER BY snapshot_id LIMIT %s',
+                              (chat_id, message_id, after_snapshot_id, limit))
+    return dict(current=current[0] if current else None, snapshots=rows,
+                next_snapshot_id=rows[-1]['snapshot_id'] if len(rows) == limit else None)
+
+
+@mcp.tool(annotations=READ)
+async def archive_status(after_chat_id: int | None = None, limit: int = 50) -> dict:
+    """Live collector heartbeat/counters, errors, indexing backlog and paginated per-chat coverage.
+    No history is loaded. Coverage describes captured events only; downtime gaps cannot be reconstructed.
+    Counts scan indexes and may be slower on large archives. Legacy rows remain preserved.
+    """
+    bounded_limit(limit)
     counts = {}
     for table in ('users', 'chats', 'messages', 'message_revisions', 'unresolved_deletions'):
         counts[table] = (await store.query(f'SELECT COUNT(*) AS n FROM {table}'))[0]['n']
@@ -143,8 +174,26 @@ async def archive_status() -> dict:
                                                       "WHERE e.model=%s AND e.text_hash=m.text_hash AND m.text<>''",
                                                       (MODEL,)))[0]['n']
     path = index_path()
-    return dict(counts=counts, model=MODEL, ann_ready=path.exists(),
-                sync=await store.query('SELECT * FROM chat_sync ORDER BY chat_id LIMIT 200'))
+    pending = await store.query('SELECT COUNT(*) AS pending,MIN(m.collected_at) AS oldest_pending_at '
+                                 'FROM messages m LEFT JOIN message_embeddings e ON e.archive_id=m.archive_id '
+                                 "WHERE m.text<>'' AND (e.archive_id IS NULL OR e.model<>%s OR e.text_hash<>m.text_hash)",
+                                 (MODEL,))
+    runs = await store.query('SELECT *, (stopped_at IS NULL AND '
+                             'heartbeat_at>=UTC_TIMESTAMP()-INTERVAL 45 SECOND) AS running '
+                             'FROM collector_runs ORDER BY run_id DESC LIMIT 1')
+    where = 'WHERE c.chat_id>%s ' if after_chat_id is not None else ''
+    params = (after_chat_id, limit) if after_chat_id is not None else (limit,)
+    chats = await store.query('SELECT c.chat_id,c.type,c.title,COUNT(m.archive_id) AS messages,'
+                              "SUM(m.ingest_source='live') AS live_messages,"
+                              "SUM(m.ingest_source='legacy') AS legacy_messages,"
+                              'MAX(m.collected_at) AS last_collected_at,MAX(m.sent_at) AS latest_message_at '
+                              'FROM chats c LEFT JOIN messages m ON m.chat_id=c.chat_id ' + where +
+                              'GROUP BY c.chat_id ORDER BY c.chat_id LIMIT %s', params)
+    return dict(counts=counts, model=MODEL, ann_ready=path.exists(), mode='live_handlers_only', backfill=False,
+                indexing=pending[0], collector=runs[0] if runs else None,
+                recent_errors=await store.query('SELECT * FROM collector_errors ORDER BY error_id DESC LIMIT 20'),
+                chats=chats, next_chat_id=chats[-1]['chat_id'] if len(chats) == limit else None,
+                coverage_note='Only received events are tracked; no history or downtime backfill is requested.')
 
 
 def main():

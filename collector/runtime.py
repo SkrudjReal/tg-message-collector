@@ -3,12 +3,12 @@ import asyncio
 import logging
 import os
 
-from pyrogram import Client, enums, filters, idle
+from pyrogram import Client, enums, filters, idle, raw, utils
 from pyrogram.errors import FloodWait, RPCError
-from pyrogram.handlers import MessageHandler, EditedMessageHandler
+from pyrogram.handlers import MessageHandler, EditedMessageHandler, RawUpdateHandler
 
 from collector.config import DATA, MODEL, chat_ids
-from collector.storage import Store
+from collector.storage import Store, reaction_counts
 from collector.search import Encoder
 from collector.vector_index import IndexWriter
 
@@ -30,88 +30,79 @@ def client(interactive=False):
     cls = Client if interactive else AuthorizedClient
     return cls('collector', workdir=str(DATA), api_id=int(os.environ['API_ID']),
                   api_hash=os.environ['API_HASH'], phone_number=os.environ['PHONE_NUMBER'],
-                  workers=1, sleep_threshold=60, hide_password=True,
+                  workers=1, sleep_threshold=60, hide_password=True, skip_updates=True,
                   fetch_replies=False, fetch_topics=False, fetch_stories=False, fetch_stickers=False)
 
 
-async def sync_chat(app, store, chat_id, own_id, history_limit):
-    await store.execute('INSERT IGNORE INTO chat_sync (chat_id) VALUES (%s)', (chat_id,))
-    state = (await store.query('SELECT * FROM chat_sync WHERE chat_id=%s', (chat_id,)))[0]
-    latest = state['latest_message_id']
-    highest = latest
-    if latest:
-        # Catch-up is independent of the historical batch limit.
-        async for msg in app.get_chat_history(chat_id, min_id=latest + 1):
-            await store.save_message(msg, own_id)
-            highest = max(highest, msg.id)
-        await store.execute('UPDATE chat_sync SET latest_message_id=%s,updated_at=UTC_TIMESTAMP(6) '
-                            'WHERE chat_id=%s', (highest, chat_id))
-    if state['history_complete']:
-        return
-    count = 0
-    oldest = state['oldest_message_id']
-    async for msg in app.get_chat_history(chat_id, max_id=(oldest - 1) if oldest else 0, limit=history_limit):
-        await store.save_message(msg, own_id)
-        highest = max(highest, msg.id)
-        count += 1
-        await store.execute('UPDATE chat_sync SET oldest_message_id=LEAST(COALESCE(oldest_message_id,%s),%s),'
-                            'updated_at=UTC_TIMESTAMP(6) WHERE chat_id=%s', (msg.id, msg.id, chat_id))
-    complete = history_limit == 0 or count < history_limit
-    await store.execute('UPDATE chat_sync SET latest_message_id=GREATEST(latest_message_id,%s),'
-                        'history_complete=%s,updated_at=UTC_TIMESTAMP(6) WHERE chat_id=%s',
-                        (highest, complete, chat_id))
-    log.info('History batch: chat=%s messages=%s complete=%s', chat_id, count, complete)
-
-
-async def history_loop(app, store, own_id, history_limit):
-    allowed = chat_ids()
+async def profile_loop(app, store, queue, pending):
+    # Event-driven enrichment only: no dialog scan or daily profile polling.
     while True:
+        user_id = await queue.get()
+        retry = False
         try:
-            if allowed:
-                ids = sorted(allowed)
-            else:
-                ids = []
-                async for dialog in app.get_dialogs():
-                    if not archive_chat(dialog.chat):
-                        continue
-                    await store.save_chat(dialog.chat)
-                    ids.append(dialog.chat.id)
-            for chat_id in ids:
-                try:
-                    chat = await app.get_chat(chat_id)
-                    if not archive_chat(chat):
-                        continue
-                    await store.save_chat(chat, details=True)
-                    await sync_chat(app, store, chat_id, own_id, history_limit)
-                except FloodWait as exc:
-                    log.warning('History FloodWait: %ss', exc.value)
-                    await asyncio.sleep(exc.value + 1)
-                except RPCError as exc:
-                    log.warning('Chat %s unavailable (%s)', chat_id, type(exc).__name__)
-                await asyncio.sleep(1)
+            full = await app.get_chat(user_id)
+            await store.save_bio(user_id, full.bio)
         except FloodWait as exc:
+            await report_error(store, 'profile', exc, user_id=user_id)
             await asyncio.sleep(exc.value + 1)
-        await asyncio.sleep(300)
+            retry = True
+        except RPCError as exc:
+            await store.execute('UPDATE users SET bio_checked_at=UTC_TIMESTAMP(6) WHERE user_id=%s', (user_id,))
+            await report_error(store, 'profile', exc, user_id=user_id)
+        finally:
+            queue.task_done()
+            if retry:
+                queue.put_nowait(user_id)
+            else:
+                pending.discard(user_id)
+        await asyncio.sleep(1)
 
 
-async def bios_loop(app, store):
+async def heartbeat_loop(store):
     while True:
-        users = await store.query('SELECT user_id FROM users WHERE is_deleted=0 AND '
-                                  '(bio_checked_at IS NULL OR bio_checked_at<UTC_TIMESTAMP()-INTERVAL 1 DAY) '
-                                  'ORDER BY bio_checked_at LIMIT 50')
-        for user in users:
-            try:
-                full = await app.get_chat(user['user_id'])
-                await store.execute('UPDATE users SET bio=%s,bio_checked_at=UTC_TIMESTAMP(6) WHERE user_id=%s',
-                                    (full.bio, user['user_id']))
-            except FloodWait as exc:
-                await asyncio.sleep(exc.value + 1)
-                break
-            except RPCError:
-                await store.execute('UPDATE users SET bio_checked_at=UTC_TIMESTAMP(6) WHERE user_id=%s',
-                                    (user['user_id'],))
-            await asyncio.sleep(1)
-        await asyncio.sleep(30)
+        await store.heartbeat()
+        await asyncio.sleep(15)
+
+
+async def report_error(store, stage, exc, **context):
+    log.error('%s failed (%s)', stage, type(exc).__name__)
+    try:
+        await store.record_error(stage, exc, **context)
+    except Exception as telemetry_error:
+        log.error('Error telemetry unavailable (%s)', type(telemetry_error).__name__)
+
+
+async def handle_raw_update(store, update, queue_profile, allowed):
+    if isinstance(update, (raw.types.UpdateUserName, raw.types.UpdateUser)):
+        known = await store.query('SELECT user_id FROM users WHERE user_id=%s', (update.user_id,))
+        if not known:
+            return
+        if isinstance(update, raw.types.UpdateUserName):
+            username = next((item.username for item in update.usernames if item.active), None)
+            await store.save_profile(update.user_id, dict(username=username, first_name=update.first_name,
+                                     last_name=update.last_name), source='telegram_update')
+        queue_profile(update.user_id)
+        await store.event_saved(metadata=True)
+        return
+    if isinstance(update, raw.types.UpdateChannelMessageViews):
+        chat_id, message_id = utils.get_peer_id(raw.types.PeerChannel(channel_id=update.channel_id)), update.id
+        metrics = dict(views=update.views, source='views_update')
+    elif isinstance(update, raw.types.UpdateChannelMessageForwards):
+        chat_id, message_id = utils.get_peer_id(raw.types.PeerChannel(channel_id=update.channel_id)), update.id
+        metrics = dict(forwards=update.forwards, source='forwards_update')
+    elif isinstance(update, raw.types.UpdateMessageReactions):
+        chat_id, message_id = utils.get_peer_id(update.peer), update.msg_id
+        metrics = dict(reactions=reaction_counts(update.reactions), source='reactions_update')
+    else:
+        return
+    if allowed and chat_id not in allowed:
+        return
+    rows = await store.query('SELECT c.type FROM messages m JOIN chats c ON c.chat_id=m.chat_id '
+                             'WHERE m.chat_id=%s AND m.message_id=%s', (chat_id, message_id))
+    if not rows or rows[0]['type'] not in ('group', 'supergroup', 'forum', 'channel'):
+        return
+    await store.save_metrics(chat_id, message_id, **metrics)
+    await store.event_saved(metadata=True)
 
 
 async def embedding_loop(store, once=False):
@@ -140,14 +131,14 @@ async def embedding_loop(store, once=False):
         await index.refresh(store)
 
 
-async def supervise(name, factory):
+async def supervise(name, factory, store):
     while True:
         try:
             await factory()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.error('%s failed (%s); retrying in 10 seconds', name, type(exc).__name__)
+            await report_error(store, name, exc)
             await asyncio.sleep(10)
 
 
@@ -175,28 +166,48 @@ async def run(args):
     allowed = chat_ids()
     own_id = None
     ready = asyncio.Event()
+    profile_queue = asyncio.Queue()
+    pending_profiles = set()
+
+    def queue_profile(user_id):
+        if user_id not in pending_profiles:
+            pending_profiles.add(user_id)
+            profile_queue.put_nowait(user_id)
 
     async def on_message(_, msg):
         await ready.wait()
         if archive_chat(msg.chat) and (not allowed or msg.chat.id in allowed):
             try:
-                await store.save_message(msg, own_id)
+                needs_bio = await store.save_message(msg, own_id)
+                if needs_bio:
+                    queue_profile(needs_bio)
+                await store.event_saved()
             except Exception as exc:
-                log.error('Message archive failed (%s); history sync will retry persisted messages', type(exc).__name__)
+                await report_error(store, 'message', exc, chat_id=msg.chat.id, message_id=msg.id)
+
+    async def on_raw(_, update, users, chats):
+        await ready.wait()
+        try:
+            await handle_raw_update(store, update, queue_profile, allowed)
+        except Exception as exc:
+            await report_error(store, 'metadata', exc)
 
     scope = filters.group | filters.channel
     app.add_handler(MessageHandler(on_message, scope))
     app.add_handler(EditedMessageHandler(on_message, scope))
+    app.add_handler(RawUpdateHandler(on_raw), group=1)
     tasks = []
     try:
+        await store.start_run()
         await app.start()
         me = await app.get_me()
         own_id = me.id
-        ready.set()
         await store.save_user(me)
-        tasks = [asyncio.create_task(supervise('history', lambda: history_loop(app, store, own_id, args.history_limit))),
-                 asyncio.create_task(supervise('bios', lambda: bios_loop(app, store))),
-                 asyncio.create_task(supervise('embeddings', lambda: embedding_loop(store)))]
+        ready.set()
+        tasks = [asyncio.create_task(supervise('profiles', lambda: profile_loop(
+                     app, store, profile_queue, pending_profiles), store)),
+                 asyncio.create_task(supervise('embeddings', lambda: embedding_loop(store), store)),
+                 asyncio.create_task(supervise('heartbeat', lambda: heartbeat_loop(store), store))]
         log.info('Collector running for user %s', own_id)
         await idle()
     finally:
@@ -205,6 +216,7 @@ async def run(args):
         await asyncio.gather(*tasks, return_exceptions=True)
         if app.is_connected:
             await app.stop()
+        await store.finish_run()
         await store.close()
 
 
@@ -217,12 +229,8 @@ def main():
         raise SystemExit('Another collector/login/embedding process is already running') from None
     parser = argparse.ArgumentParser(description='Telegram message collector')
     parser.add_argument('command', choices=['login', 'login-qr', 'run', 'embed'], nargs='?', default='run')
-    parser.add_argument('--history-limit', type=int, default=int(os.getenv('HISTORY_LIMIT', '1000')),
-                        help='Older messages per chat per 5-minute cycle; 0 means all')
     parser.add_argument('--once', action='store_true', help='Drain the embedding backlog and exit')
     args = parser.parse_args()
-    if args.history_limit < 0:
-        parser.error('--history-limit must be >=0')
     logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     logging.getLogger('asyncmy').setLevel(logging.ERROR)
     asyncio.run(run(args))

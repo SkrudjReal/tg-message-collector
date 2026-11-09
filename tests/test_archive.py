@@ -13,7 +13,6 @@ import unittest
 import uuid
 import socket
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -22,7 +21,7 @@ os.environ['MYSQL_DATABASE'] = TEST_DB
 
 from collector.storage import Store, message_row, utc  # noqa: E402
 from collector.search import Search  # noqa: E402
-from collector.runtime import embedding_loop, sync_chat  # noqa: E402
+from collector.runtime import embedding_loop  # noqa: E402
 from collector.vector_index import index_path  # noqa: E402
 from pyrogram import enums  # noqa: E402
 from pyrogram.types import Message, Chat, User  # noqa: E402
@@ -45,7 +44,8 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         # All destructive cleanup is strictly within a freshly generated test database.
         admin('USE `' + TEST_DB + '`;' + ''.join('TRUNCATE TABLE ' + name + ';' for name in (
-            'messages', 'message_revisions', 'message_embeddings', 'users', 'chats', 'chat_sync', 'unresolved_deletions')))
+            'messages', 'message_revisions', 'message_embeddings', 'users', 'chats', 'chat_sync', 'unresolved_deletions',
+            'user_history', 'message_metrics', 'message_metric_history', 'collector_runs', 'collector_errors')))
         index_path().unlink(missing_ok=True)
         self.writer = await Store.open()
         self.reader = await Store.open(readonly=True)
@@ -157,37 +157,78 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         ft = await self.reader.query('EXPLAIN SELECT * FROM messages WHERE MATCH(text) AGAINST (%s IN BOOLEAN MODE)', ('ремонт',))
         self.assertEqual(ft[0]['type'], 'fulltext')
 
-    async def test_history_catchup_and_backfill_checkpoints(self):
-        saved = []
-
-        class FakeApp:
-            ids = [5, 4, 3, 2, 1]
-
-            async def get_chat_history(self, chat_id, min_id=0, max_id=0, limit=0):
-                ids = [i for i in self.ids if i >= min_id and (not max_id or i <= max_id)]
-                for i in ids[:limit or len(ids)]:
-                    yield SimpleNamespace(id=i)
-
-        original = self.writer.save_message
-
-        async def save(msg, own_id):
-            saved.append(msg.id)
-
-        self.writer.save_message = save
-        app = FakeApp()
-        await sync_chat(app, self.writer, -1, 999, 2)
-        app.ids = [8, 7, 6, 5, 4, 3, 2, 1]
-        await sync_chat(app, self.writer, -1, 999, 2)
-        await sync_chat(app, self.writer, -1, 999, 2)
-        state = (await self.reader.query('SELECT * FROM chat_sync'))[0]
-        self.assertEqual(state['latest_message_id'], 8)
-        self.assertTrue(state['history_complete'])
-        self.assertEqual(set(saved), set(range(1, 9)))
-        self.writer.save_message = original
-
     async def test_utc_conversion(self):
         dt = datetime(2026, 1, 1, 12, tzinfo=timezone(timedelta(hours=2)))
         self.assertEqual(utc(dt), datetime(2026, 1, 1, 10))
+
+    async def test_profile_history_retains_identity_and_bio_changes(self):
+        user = User(id=123, first_name='First', last_name='Name', username='original')
+        await self.writer.save_user(user)
+        await self.writer.save_user(user)
+        await self.writer.save_bio(123, 'old bio')
+        await self.writer.save_bio(123, 'old bio')
+        user.username = 'renamed'
+        user.first_name = 'Second'
+        await self.writer.save_user(user)
+        await self.writer.save_bio(123, 'new bio')
+        rows = await self.reader.query('SELECT * FROM user_history WHERE user_id=123 ORDER BY snapshot_id')
+        self.assertEqual(len(rows), 4)
+        self.assertEqual([r['username'] for r in rows], ['original', 'original', 'renamed', 'renamed'])
+        self.assertEqual([r['bio'] for r in rows], [None, 'old bio', 'old bio', 'new bio'])
+        self.assertEqual(rows[0]['first_name'], 'First')
+        await self.writer.save_profile(999, dict(first_name='Unknown'), source='telegram_update')
+        self.assertEqual(await self.reader.query('SELECT * FROM users WHERE user_id=999'), [])
+
+    async def test_metrics_snapshots_merge_partial_updates_without_losing_zero(self):
+        await self.writer.save_row(row())
+        await self.writer.save_metrics(-10001, 1, views=100, forwards=0,
+                                       reactions=[dict(emoji='❤', count=2)], source='message')
+        await self.writer.save_metrics(-10001, 1, views=100)
+        await self.writer.save_metrics(-10001, 1, views=120)
+        await self.writer.save_metrics(-10001, 1, reactions=[])
+        rows = await self.reader.query('SELECT * FROM message_metric_history ORDER BY snapshot_id')
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([r['views'] for r in rows], [100, 120, 120])
+        self.assertTrue(all(r['forwards'] == 0 for r in rows))
+        self.assertEqual(rows[-1]['reactions'], [])
+        self.assertEqual(rows[0]['reactions'][0]['count'], 2)
+
+    async def test_all_file_media_ids_are_returned_without_download(self):
+        from types import SimpleNamespace
+        chat = Chat(id=-10001, type=enums.ChatType.SUPERGROUP, title='Test')
+        for index, name in enumerate(('photo', 'animation', 'sticker', 'video', 'voice', 'video_note',
+                                      'audio', 'document', 'live_photo'), 1):
+            payload = SimpleNamespace(file_id=f'{name}-file-id', file_unique_id=f'{name}-unique')
+            msg = Message(id=index, chat=chat, date=datetime(2026, 1, 1),
+                          media=getattr(enums.MessageMediaType, name.upper()), **{name: payload})
+            await self.writer.save_message(msg, 999)
+        found = (await self.search.messages(chat_id=-10001))['messages']
+        self.assertEqual(len(found), 9)
+        for msg in found:
+            self.assertEqual(msg['file_id'], msg['media_type'] + '-file-id')
+            self.assertEqual(msg['media_file_ids'], [msg['file_id']])
+        from collector.storage import media_metadata
+        compound = media_metadata(SimpleNamespace(media=[SimpleNamespace(file_id='photo'),
+                                                         SimpleNamespace(file_id='video')]))
+        self.assertEqual([m['file_id'] for m in compound['files']], ['photo', 'video'])
+
+    async def test_run_status_tracks_errors_without_exception_contents(self):
+        await self.writer.start_run()
+        await self.writer.event_saved()
+        await self.writer.event_saved(metadata=True)
+        await self.writer.record_error('message', ValueError('private-data-must-not-be-logged'), chat_id=-10001,
+                                       message_id=55)
+        await self.writer.heartbeat()
+        state = (await self.reader.query('SELECT * FROM collector_runs'))[0]
+        self.assertEqual(state['received_count'], 2)
+        self.assertEqual(state['saved_count'], 1)
+        self.assertEqual(state['message_errors'], 1)
+        self.assertEqual(state['metadata_events'], 1)
+        errors = await self.reader.query('SELECT * FROM collector_errors')
+        self.assertEqual(errors[0]['error_type'], 'ValueError')
+        self.assertNotIn('private-data', str(errors))
+        await self.writer.finish_run()
+        self.assertIsNotNone((await self.reader.query('SELECT stopped_at FROM collector_runs'))[0]['stopped_at'])
 
     async def test_http_mcp_tools_auth_host_and_real_data(self):
         import httpx
@@ -195,6 +236,10 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         from mcp.client.streamable_http import streamable_http_client
 
         await self.writer.save_row(row(text='Тестовое сообщение для MCP'))
+        await self.writer.save_row(dict(row(message_id=2, text='Фото'), media_type='photo',
+                                        media='{"file_id":"test-photo-id"}'))
+        await self.writer.save_user(User(id=123, first_name='Test', username='test'))
+        await self.writer.save_metrics(-10001, 2, views=10, forwards=0)
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             port = sock.getsockname()[1]
@@ -231,13 +276,22 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
                             await session.initialize()
                             tools = (await session.list_tools()).tools
                             self.assertEqual({t.name for t in tools}, {'search_messages', 'semantic_search',
-                                             'get_message', 'list_users', 'list_chats', 'archive_status'})
+                                             'get_message', 'list_users', 'list_chats', 'archive_status',
+                                             'get_user_history', 'get_message_metrics'})
                             self.assertTrue(all(t.annotations.readOnlyHint for t in tools))
                             result = await session.call_tool('search_messages', {'chat_id': -10001})
                             self.assertFalse(result.isError)
                             self.assertIn('Тестовое сообщение', result.content[0].text)
                             status = await session.call_tool('archive_status', {})
                             self.assertFalse(status.isError)
+                            import json
+                            self.assertFalse(json.loads(status.content[0].text)['backfill'])
+                            media = await session.call_tool('get_message', {'chat_id': -10001, 'message_id': 2})
+                            self.assertIn('test-photo-id', media.content[0].text)
+                            profile = await session.call_tool('get_user_history', {'user_id': 123})
+                            self.assertFalse(profile.isError)
+                            metrics = await session.call_tool('get_message_metrics', {'chat_id': -10001, 'message_id': 2})
+                            self.assertFalse(metrics.isError)
                             invalid = await session.call_tool('search_messages', {'limit': 5000})
                             self.assertTrue(invalid.isError)
             finally:
@@ -246,7 +300,7 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
 
 
 if __name__ == '__main__':
-    schema = (ROOT / 'sql/001_archive.sql').read_text()
+    schema = '\n'.join(p.read_text() for p in sorted((ROOT / 'sql').glob('*.sql')))
     admin(f'CREATE DATABASE `{TEST_DB}` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;'
           f"GRANT SELECT,INSERT,UPDATE ON `{TEST_DB}`.* TO 'tg_collector'@'127.0.0.1';"
           f"GRANT SELECT ON `{TEST_DB}`.* TO 'tg_reader'@'127.0.0.1';"
