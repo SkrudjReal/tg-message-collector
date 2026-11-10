@@ -13,7 +13,7 @@ class EncoderTests(unittest.TestCase):
     def test_explicit_mean_pooling_preserves_vectors_without_warning_filters(self):
         from fastembed import TextEmbedding
 
-        texts = ['Ремонт велосипеда завтра', 'Renting an apartment', '', 'длинное сообщение ' * 100]
+        texts = ['Ремонт велосипеда завтра', 'Renting an apartment', '', 'длинное сообщение ' * 100] * 3
         with warnings.catch_warnings(record=True):
             reference = TextEmbedding(MODEL, cache_dir=str(DATA / 'models'), threads=2)
         expected = np.asarray(list(reference.embed(texts)), dtype='<f4')

@@ -342,7 +342,10 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
                             tools = (await session.list_tools()).tools
                             self.assertEqual({t.name for t in tools}, {'search_messages', 'semantic_search',
                                              'get_message', 'list_users', 'list_chats', 'archive_status',
-                                             'get_user_history', 'get_message_metrics'})
+                                             'get_user_history', 'get_message_metrics', 'get_statistics', 'get_activity',
+                                             'get_top_words', 'get_top_phrases', 'get_top_mentions', 'get_top_authors',
+                                             'get_top_posts', 'get_reply_partners', 'get_message_history',
+                                             'compare_periods', 'get_archive_coverage'})
                             self.assertTrue(all(t.annotations.readOnlyHint for t in tools))
                             result = await session.call_tool('search_messages', {'chat_id': -10001})
                             self.assertFalse(result.isError)

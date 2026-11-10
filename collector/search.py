@@ -36,7 +36,7 @@ class Encoder:
     def _encode(self, texts):
         if self.model is None:
             self.model = embedding_model()
-        vectors = np.asarray(list(self.model.embed(texts)), dtype='<f4')
+        vectors = np.asarray(list(self.model.embed(texts, batch_size=8)), dtype='<f4')
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         return vectors / np.maximum(norms, 1e-12)
 

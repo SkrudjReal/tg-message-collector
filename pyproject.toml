@@ -12,6 +12,7 @@ dependencies = [
     "fastembed>=0.7,<0.8",
     "numpy>=2,<3",
     "usearch>=2.21,<3",
+    "pymorphy3>=2,<3",
 ]
 
 [dependency-groups]

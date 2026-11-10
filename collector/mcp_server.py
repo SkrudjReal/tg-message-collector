@@ -11,6 +11,7 @@ from collector.search import Search, bounded_limit
 from collector.storage import Store, utc
 from collector.config import MODEL
 from collector.vector_index import index_path
+from collector.analytics_tools import register_analytics
 
 store = None
 search = None
@@ -48,10 +49,7 @@ async def search_messages(query: str | None = None, chat_id: int | None = None,
                           mode: str = 'fulltext', limit: int = 50,
                           topic_id: int | None = None, before_date: datetime | None = None,
                           before_chat_id: int | None = None, before_message_id: int | None = None) -> dict:
-    """Search by chat/user/date/topic or across all chats. Boolean FULLTEXT: +word, word*, \"phrase\".
-    Substring matches literal text including short words, but may scan rows.
-    Use all three next_cursor fields for stable pagination; dates are UTC.
-    """
+    """Поиск по словам, чату, автору, датам и теме. FULLTEXT или substring; для пагинации передайте все поля next_cursor."""
     return await search.messages(query=query, mode=mode, limit=limit, chat_id=chat_id,
                                   sender_user_id=sender_user_id, sender_chat_id=sender_chat_id,
                                   since=utc(since), until=utc(until),
@@ -63,11 +61,7 @@ async def search_messages(query: str | None = None, chat_id: int | None = None,
 async def semantic_search(query: str, chat_id: int | None = None, sender_user_id: int | None = None,
                           sender_chat_id: int | None = None, since: datetime | None = None,
                           until: datetime | None = None, limit: int = 20, candidate_limit: int = 50000) -> dict:
-    """Local multilingual semantic search, including paraphrases with different words.
-    Without filters: HNSW approximate nearest neighbors across the full published index.
-    With filters: exact cosine within newest candidate_limit matching messages (max 200000).
-    Check approximate, truncated and archive_status embedding coverage.
-    """
+    """Поиск по смыслу: HNSW без фильтров, точное сравнение ограниченной выборки с фильтрами. Проверяйте truncated и покрытие."""
     return await search.semantic(query, limit=limit, candidate_limit=candidate_limit,
                                   chat_id=chat_id, sender_user_id=sender_user_id,
                                   sender_chat_id=sender_chat_id, since=utc(since), until=utc(until))
@@ -76,7 +70,7 @@ async def semantic_search(query: str, chat_id: int | None = None, sender_user_id
 @mcp.tool(annotations=READ)
 async def list_users(username: str | None = None, user_id: int | None = None,
                      after_user_id: int = 0, limit: int = 50) -> list:
-    """Read users, usernames and bios. Null bio may mean unavailable/not enriched yet."""
+    """Текущие профили пользователей: ID, username, имя и био. Null bio может означать отсутствие проверки."""
     bounded_limit(limit)
     clauses, params = ['user_id>%s'], [after_user_id]
     if user_id is not None:
@@ -92,7 +86,7 @@ async def list_users(username: str | None = None, user_id: int | None = None,
 @mcp.tool(annotations=READ)
 async def list_chats(chat_id: int | None = None, username: str | None = None,
                      after_chat_id: int | None = None, limit: int = 50) -> list:
-    """Read archived chat metadata; paginate using last chat_id."""
+    """Метаданные сохранённых групп и каналов. Для следующей страницы используйте последний chat_id."""
     bounded_limit(limit)
     clauses, params = [], []
     for name, value in [('chat_id', chat_id), ('username', username.lstrip('@') if username else None)]:
@@ -108,7 +102,7 @@ async def list_chats(chat_id: int | None = None, username: str | None = None,
 
 @mcp.tool(annotations=READ)
 async def get_message(chat_id: int, message_id: int, context: int = 5) -> dict:
-    """Read a message, available reply target, prior text versions and neighboring messages."""
+    """Сообщение, file_id медиа, доступная цель reply, соседние сообщения, источники и сохранённые версии текста."""
     if not 0 <= context <= 50:
         raise ValueError('context must be 0..50')
     rows = await store.query('SELECT * FROM messages WHERE chat_id=%s AND message_id=%s', (chat_id, message_id))
@@ -141,20 +135,31 @@ async def get_message(chat_id: int, message_id: int, context: int = 5) -> dict:
 
 @mcp.tool(annotations=READ)
 async def get_user_history(user_id: int, after_snapshot_id: int = 0, limit: int = 50) -> dict:
-    """Observed username, first/last name and bio snapshots. No retrospective Telegram requests.
-    A legacy_baseline is the state retained before history tracking, not reconstructed past changes.
-    """
+    """Текущий профиль и общая история имени, username и био: снимки, изменённые поля и даты. Доступна пагинация."""
     bounded_limit(limit)
+    if after_snapshot_id < 0:
+        raise ValueError('after_snapshot_id must be nonnegative')
+    current = await store.query('SELECT * FROM users WHERE user_id=%s', (user_id,))
+    previous = await store.query('SELECT * FROM user_history WHERE user_id=%s AND snapshot_id<=%s '
+                                 'ORDER BY snapshot_id DESC LIMIT 1', (user_id, after_snapshot_id))
     rows = await store.query('SELECT * FROM user_history WHERE user_id=%s AND snapshot_id>%s '
-                              'ORDER BY snapshot_id LIMIT %s', (user_id, after_snapshot_id, limit))
-    return dict(snapshots=rows, next_snapshot_id=rows[-1]['snapshot_id'] if len(rows) == limit else None)
+                              'ORDER BY snapshot_id LIMIT %s', (user_id, after_snapshot_id, limit + 1))
+    total = (await store.query('SELECT COUNT(*) AS n FROM user_history WHERE user_id=%s', (user_id,)))[0]['n']
+    prior = previous[0] if previous else None
+    for row in rows[:limit]:
+        row['changes'] = {key: dict(before=prior[key], after=row[key])
+                          for key in ('username', 'first_name', 'last_name', 'bio')
+                          if prior and prior[key] != row[key]}
+        row['baseline'] = prior is None
+        prior = row
+    return dict(current=current[0] if current else None, snapshots=rows[:limit], total_snapshots=total,
+                next_snapshot_id=rows[limit - 1]['snapshot_id'] if len(rows) > limit else None,
+                note='Observed states only; legacy_baseline is not reconstructed history. Null bio may be unchecked.')
 
 
 @mcp.tool(annotations=READ)
 async def get_message_metrics(chat_id: int, message_id: int, after_snapshot_id: int = 0, limit: int = 50) -> dict:
-    """Observed views/forwards/reaction-count snapshots. Null means not supplied by Telegram.
-    Event-driven only: no scheduled post refresh; absence of a snapshot does not mean zero.
-    """
+    """История наблюдённых просмотров, пересылок и реакций сообщения. Null означает неизвестное значение, а не ноль."""
     bounded_limit(limit)
     current = await store.query('SELECT * FROM message_metrics WHERE chat_id=%s AND message_id=%s',
                                 (chat_id, message_id))
@@ -167,10 +172,7 @@ async def get_message_metrics(chat_id: int, message_id: int, after_snapshot_id: 
 
 @mcp.tool(annotations=READ)
 async def archive_status(after_chat_id: int | None = None, limit: int = 50) -> dict:
-    """Live collector heartbeat/counters, errors, indexing backlog and paginated per-chat coverage.
-    No history is loaded. Coverage describes captured events only; downtime gaps cannot be reconstructed.
-    Counts scan indexes and may be slower on large archives. Legacy rows remain preserved.
-    """
+    """Состояние сборщика, ошибки, размер архива, очередь эмбеддингов и задания импорта. Без запросов к Telegram."""
     bounded_limit(limit)
     counts = {}
     for table in ('users', 'chats', 'messages', 'message_revisions', 'unresolved_deletions'):
@@ -208,6 +210,9 @@ async def archive_status(after_chat_id: int | None = None, limit: int = 50) -> d
                 recent_errors=await store.query('SELECT * FROM collector_errors ORDER BY error_id DESC LIMIT 20'),
                 chats=chats, next_chat_id=chats[-1]['chat_id'] if len(chats) == limit else None,
                 coverage_note='The live collector tracks events only. Explicit channel imports are reported separately.')
+
+
+register_analytics(mcp, lambda: store, READ)
 
 
 def main():
