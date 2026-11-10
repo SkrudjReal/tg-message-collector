@@ -9,7 +9,7 @@
 [![Stars](https://img.shields.io/github/stars/SkrudjReal/tg-message-collector?style=for-the-badge&color=c4b5fd&labelColor=19152e)](https://github.com/SkrudjReal/tg-message-collector/stargazers)
 [![Forks](https://img.shields.io/github/forks/SkrudjReal/tg-message-collector?style=for-the-badge&color=a5b4fc&labelColor=19152e)](https://github.com/SkrudjReal/tg-message-collector/forks)
 
-[Запуск](#запуск) · [Возможности](#возможности) · [Документация](docs/operations.md) · [Сообщить о проблеме](https://github.com/SkrudjReal/tg-message-collector/issues/new)
+[Запуск](#запуск) · [Возможности](#возможности) · [MCP-инструменты](#mcp-инструменты) · [Документация](docs/operations.md) · [Сообщить о проблеме](https://github.com/SkrudjReal/tg-message-collector/issues/new)
 
 </div>
 
@@ -25,6 +25,40 @@
 | Поиск | Индексы чата/автора/даты, MySQL FULLTEXT, буквальная подстрока, локальные multilingual embeddings |
 | Семантика | HNSW по всему индексу; точный cosine по ограниченной выборке при фильтрах |
 | MCP | `http://127.0.0.1:8765/mcp`, Bearer token, отдельный MySQL-пользователь с `SELECT` |
+
+## MCP-инструменты
+
+Сервер предоставляет **19 инструментов только для чтения**. Они работают с сохранённым
+архивом MySQL и не запрашивают Telegram. Адрес по умолчанию:
+`http://127.0.0.1:8765/mcp`, авторизация — `Authorization: Bearer <MCP_TOKEN>`.
+
+| Инструмент | Назначение |
+| :--- | :--- |
+| `search_messages` | Поиск по словам или подстроке, чату, автору, датам и теме; пагинация |
+| `semantic_search` | Поиск по смыслу с фильтрами и показателями покрытия индекса |
+| `list_users` | Текущие профили: ID, username, имя и био |
+| `list_chats` | Список и метаданные сохранённых групп и каналов |
+| `get_message` | Сообщение, соседний контекст, reply, file_id медиа и источники |
+| `get_user_history` | Текущий профиль и общая история имени, username и био |
+| `get_message_history` | Текущий текст сообщения и сохранённые версии правок |
+| `get_message_metrics` | История наблюдённых просмотров, пересылок и реакций |
+| `get_statistics` | Число сообщений, авторов, replies, правок, медиа и длина текста |
+| `get_activity` | Активность по часам, дням, неделям и месяцам с часовым поясом |
+| `get_top_words` | Топ слов: употребления, число сообщений и примеры; русские леммы опциональны |
+| `get_top_phrases` | Топ словосочетаний из 2–5 последовательных слов |
+| `get_top_mentions` | Частые буквальные @упоминания в тексте |
+| `get_top_authors` | Активные авторы и их доля сообщений в выборке |
+| `get_top_posts` | Публикации по сохранённым просмотрам, пересылкам или реакциям |
+| `get_reply_partners` | Кому пользователь чаще отвечает и кто отвечает ему |
+| `compare_periods` | Сравнение показателей двух периодов и, опционально, частоты слов |
+| `get_archive_coverage` | Доступные периоды, источники данных и отсутствующие reply targets |
+| `archive_status` | Состояние сборщика, ошибки, объём архива, очередь индексации и импорт |
+
+[Параметры аналитики, фильтры и ограничения →](docs/analytics.md) ·
+[Подключение MCP и настройка доступа →](docs/operations.md#mcp-только-для-чтения)
+
+Статистика относится к доступному архиву. При анализе проверяй период, `truncated`
+и покрытие; снимки профиля и метрик отражают только наблюдённые состояния.
 
 ## Запуск
 
