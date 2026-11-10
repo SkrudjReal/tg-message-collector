@@ -152,6 +152,12 @@ class AnalyticsSQLTests(unittest.IsolatedAsyncioTestCase):
         comparison = await registry.tools['compare_periods'](datetime(2025, 1, 1), datetime(2025, 2, 1),
             datetime(2026, 1, 1), datetime(2026, 2, 1), MessageScope(chat_id=-10011))
         self.assertEqual(comparison['changes']['messages'], {'absolute': 8, 'percent': None})
+        vocabulary = await self.a.vocabulary_change(MessageScope(chat_id=123), MessageScope(chat_id=-10011), 10, 100)
+        code = next(c for c in vocabulary['changes'] if c['term'] == 'claude')
+        self.assertEqual(code['first_occurrences'], 0)
+        self.assertEqual(code['second_occurrences'], 2)
+        self.assertIsNone(code['percent'])
+        self.assertFalse(vocabulary['second_metadata']['truncated'])
         history = await registry.tools['get_message_history'](-10011, 1)
         self.assertEqual(history['current']['message_id'], 1)
         self.assertEqual(history['revisions'], [])

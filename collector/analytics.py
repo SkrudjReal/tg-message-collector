@@ -180,7 +180,8 @@ class Analytics:
         return result
 
     async def frequencies(self, scope, n=1, normalization='literal', remove_stopwords=True,
-                          extra_stopwords=(), limit=10, min_messages=1, max_messages=50000, mentions=False):
+                          extra_stopwords=(), limit=10, min_messages=1, max_messages=50000, mentions=False,
+                          return_counter=False):
         if not 1 <= limit <= 100 or not 1 <= min_messages <= 200000 or not 1 <= max_messages <= 200000:
             raise ValueError('limit: 1..100; min_messages/max_messages: 1..200000')
         from asyncmy.cursors import SSDictCursor
@@ -210,7 +211,24 @@ class Analytics:
         meta['truncation_reason'] = counter.stop_reason or ('message_limit' if truncated else None)
         meta['matching_messages'] = None if truncated else counter.processed
         meta['max_distinct_terms'] = 100000
-        return dict(top=top, metadata=meta)
+        result = dict(top=top, metadata=meta)
+        return (result, counter) if return_counter else result
+
+    async def vocabulary_change(self, first, second, limit, max_messages):
+        one, c1 = await self.frequencies(first, limit=limit, max_messages=max_messages, return_counter=True)
+        two, c2 = await self.frequencies(second, limit=limit, max_messages=max_messages, return_counter=True)
+        terms = set(c1.counts) | set(c2.counts)
+        ranked = sorted(terms, key=lambda t: (-abs(c2.counts[t] - c1.counts[t]), t))[:limit]
+        changes = []
+        for term in ranked:
+            before, after = c1.counts[term], c2.counts[term]
+            n1, n2 = c1.text_messages, c2.text_messages
+            changes.append(dict(term=term, first_occurrences=before, second_occurrences=after,
+                absolute=after - before, percent=round((after - before) * 100 / before, 2) if before else None,
+                first_per_1000_text_messages=round(before * 1000 / n1, 2) if n1 else None,
+                second_per_1000_text_messages=round(after * 1000 / n2, 2) if n2 else None))
+        return dict(changes=changes, first_metadata=one['metadata'], second_metadata=two['metadata'],
+                    note='Largest absolute count changes; rates per 1000 text messages aid comparison of different volumes.')
 
     async def grouped(self, scope, column):
         if column not in ('media_type', 'ingest_source'):
@@ -303,7 +321,7 @@ class Analytics:
                  'FROM JSON_TABLE(x.reactions,\'$[*]\' COLUMNS(n BIGINT PATH \'$.count\')) j),0) END'
                  ) if metric == 'reactions' else f'x.{metric}'
         rows = await self.store.query(SELECT + 'm.chat_id,m.message_id,m.sender_user_id,m.sender_chat_id,m.sent_at,'
-            'LEFT(m.text,500) AS text,x.views,x.forwards,x.observed_at,' + score + ' AS score '
+            'LEFT(m.text,500) AS text,m.media_type,m.media,x.views,x.forwards,x.observed_at,' + score + ' AS score '
             'FROM messages m JOIN message_metrics x ON x.chat_id=m.chat_id AND x.message_id=m.message_id '
             'WHERE ' + where + ' HAVING score IS NOT NULL '
             'ORDER BY score DESC,m.sent_at DESC,m.chat_id,m.message_id LIMIT %s', params + (limit,))

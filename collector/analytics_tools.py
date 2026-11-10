@@ -102,8 +102,12 @@ def register_analytics(mcp, get_store, annotations):
     @mcp.tool(annotations=annotations)
     async def compare_periods(first_since: datetime, first_until: datetime,
                               second_since: datetime, second_until: datetime,
-                              scope: MessageScope | None = None) -> dict:
-        """Сравнение числа сообщений, авторов, ответов и медиа за два периода; абсолютное и процентное изменение."""
+                              scope: MessageScope | None = None, include_vocabulary: bool = False,
+                              word_limit: int = 10, max_messages: int = 50000) -> dict:
+        """Сравнение статистики двух периодов; include_vocabulary добавляет изменения частоты слов и нормированные частоты."""
+        bounded_limit(word_limit, 100)
+        if not 1 <= max_messages <= 200000:
+            raise ValueError('max_messages must be 1..200000')
         scope = scope or MessageScope()
         if scope.since or scope.until:
             raise ValueError('Pass dates in first/second_since/until, not scope')
@@ -116,8 +120,12 @@ def register_analytics(mcp, get_store, annotations):
             before, after = int(one[k]), int(two[k])
             changes[k] = dict(absolute=after - before,
                               percent=round((after - before) * 100 / before, 2) if before else None)
-        return dict(first=dict(counts=one, metadata=metadata(first)), second=dict(counts=two, metadata=metadata(second)),
-                    changes=changes, note='Percent is null for a zero baseline. Period lengths are not normalized.')
+        result = dict(first=dict(counts=one, metadata=metadata(first)),
+                      second=dict(counts=two, metadata=metadata(second)), changes=changes,
+                      note='Percent is null for a zero baseline. Count totals are not normalized by period length.')
+        if include_vocabulary:
+            result['vocabulary'] = await a.vocabulary_change(first, second, word_limit, max_messages)
+        return result
 
     @mcp.tool(annotations=annotations)
     async def get_archive_coverage(scope: MessageScope | None = None, limit: int = 100) -> dict:
