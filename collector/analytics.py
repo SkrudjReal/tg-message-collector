@@ -246,7 +246,7 @@ class Analytics:
         rows = await self.store.query(SELECT + "DATE_FORMAT(m.sent_at,'%%Y-%%m-%%d %%H:%%i') AS minute,"
             'COUNT(*) AS messages FROM messages m WHERE ' + where + ' GROUP BY minute ORDER BY minute DESC LIMIT 200001',
             params)
-        counts = Counter()
+        counts, bucket_order = Counter(), {}
         for r in rows[:200000]:
             stamp = datetime.strptime(r['minute'], '%Y-%m-%d %H:%M').replace(tzinfo=timezone.utc).astimezone(zone)
             if bucket == 'hour':
@@ -259,7 +259,8 @@ class Analytics:
             else:
                 key = stamp.date().isoformat()
             counts[key] += r['messages']
-        keys = sorted(counts, reverse=True)[:limit]
+            bucket_order[key] = max(bucket_order.get(key, float('-inf')), stamp.timestamp())
+        keys = sorted(counts, key=bucket_order.__getitem__, reverse=True)[:limit]
         meta = metadata(scope, timezone=timezone_name, bucket=bucket,
                         processed_messages=sum(r['messages'] for r in rows[:200000]),
                         zero_buckets_omitted=True, order='newest bucket first', available_buckets=len(counts))

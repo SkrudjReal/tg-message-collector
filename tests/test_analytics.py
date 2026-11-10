@@ -119,6 +119,8 @@ class AnalyticsSQLTests(unittest.IsolatedAsyncioTestCase):
         dst = await self.a.activity(MessageScope(chat_id=-10033), 'hour', 'Europe/Warsaw', 10)
         self.assertEqual(len(dst['buckets']), 2)
         self.assertEqual({b['messages'] for b in dst['buckets']}, {1})
+        self.assertTrue(dst['buckets'][0]['bucket'].endswith('+01:00'))
+        self.assertTrue(dst['buckets'][1]['bucket'].endswith('+02:00'))
         coverage = await self.a.coverage(MessageScope(chat_id=-10011), 10)
         self.assertEqual(coverage['replies']['missing_reply_targets'], 1)
         authors = await self.a.authors(MessageScope(chat_id=-10011), 10)
