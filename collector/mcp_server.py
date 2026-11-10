@@ -127,9 +127,16 @@ async def get_message(chat_id: int, message_id: int, context: int = 5) -> dict:
                                     'ORDER BY revision_id LIMIT 200', (chat_id, message_id))
     metrics = await store.query('SELECT * FROM message_metrics WHERE chat_id=%s AND message_id=%s',
                                 (chat_id, message_id))
+    sources = await store.query('SELECT * FROM message_sources '
+                               'WHERE chat_id=%s AND message_id=%s ORDER BY account_id',
+                               (chat_id, message_id))
+    for source in sources:
+        media = source.get('media') or {}
+        source['file_id'] = media.get('file_id')
+        source['media_file_ids'] = [item['file_id'] for item in media.get('files', []) if item.get('file_id')]
     return dict(message=msg, reply=reply[0] if reply else None,
                 before=list(reversed(before)), after=after, revisions=revisions,
-                metrics=metrics[0] if metrics else None)
+                metrics=metrics[0] if metrics else None, sources=sources)
 
 
 @mcp.tool(annotations=READ)
@@ -186,14 +193,21 @@ async def archive_status(after_chat_id: int | None = None, limit: int = 50) -> d
     chats = await store.query('SELECT c.chat_id,c.type,c.title,COUNT(m.archive_id) AS messages,'
                               "SUM(m.ingest_source='live') AS live_messages,"
                               "SUM(m.ingest_source='legacy') AS legacy_messages,"
+                              "SUM(m.ingest_source IN ('channel_history','chat_history')) AS history_messages,"
                               'MAX(m.collected_at) AS last_collected_at,MAX(m.sent_at) AS latest_message_at '
                               'FROM chats c LEFT JOIN messages m ON m.chat_id=c.chat_id ' + where +
                               'GROUP BY c.chat_id ORDER BY c.chat_id LIMIT %s', params)
     return dict(counts=counts, model=MODEL, ann_ready=path.exists(), mode='live_handlers_only', backfill=False,
                 indexing=pending[0], collector=runs[0] if runs else None,
+                channel_imports=await store.query('SELECT scope_key,account_id,since_at,status,COUNT(*) AS channels,'
+                    'SUM(processed) AS processed,SUM(inserted) AS inserted,MAX(updated_at) AS updated_at '
+                    'FROM scoped_channel_imports GROUP BY scope_key,account_id,since_at,status'),
+                previous_unscoped_imports=await store.query('SELECT account_id,status,COUNT(*) AS channels,'
+                    'SUM(processed) AS processed,SUM(inserted) AS inserted,MAX(updated_at) AS updated_at '
+                    'FROM channel_imports GROUP BY account_id,status'),
                 recent_errors=await store.query('SELECT * FROM collector_errors ORDER BY error_id DESC LIMIT 20'),
                 chats=chats, next_chat_id=chats[-1]['chat_id'] if len(chats) == limit else None,
-                coverage_note='Only received events are tracked; no history or downtime backfill is requested.')
+                coverage_note='The live collector tracks events only. Explicit channel imports are reported separately.')
 
 
 def main():

@@ -57,6 +57,35 @@ cover/
 
 # Django stuff:
 *.log
+
+# Telegram credentials, exported sessions and local databases
+sessions/
+tdata/
+session*.txt
+session*.json
+*.session-string
+*.sqlite*
+*.db
+*.dump
+*.sql.gz
+*.sql.zst
+
+# Secrets, private keys, backups and personal export targets
+.env*
+!.env.example
+settings.env*
+!settings.env.example
+*.pem
+*.key
+*.bak
+auth.json
+credentials*.json
+tokens*.json
+secrets/
+credentials/
+backups/
+exports/
+/config/channel-import-targets.txt
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

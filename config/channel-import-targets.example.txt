@@ -1,0 +1,2 @@
+# Replace with the public channel links you explicitly want to import.
+https://t.me/your_public_channel

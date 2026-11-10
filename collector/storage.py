@@ -65,7 +65,7 @@ def reaction_counts(value):
     return sorted(result, key=lambda r: (r['emoji'] or '', r['custom_emoji_id'] or '', r['paid']))
 
 
-def message_row(message, own_id):
+def message_row(message, own_id, source='live'):
     user = message.from_user
     sender_chat = message.sender_chat
     text = str(message.text or message.caption or '')
@@ -100,7 +100,8 @@ def message_row(message, own_id):
         forward_info=json_text(forward) if any(forward.values()) else None,
         media_group_id=str(message.media_group_id) if message.media_group_id else None,
         service_type=kind(message.service), outgoing=bool(message.outgoing),
-        ingest_source='live',
+        ingest_source=source, source_account_id=own_id,
+        author_signature=getattr(message, 'author_signature', None),
     )
 
 
@@ -217,61 +218,122 @@ class Store:
                                 reactions=reaction_counts(message.reactions), source='message')
         return message.from_user.id if message.from_user and needs_bio else None
 
+    @staticmethod
+    async def _save_row(cur, row):
+        cols = list(row)
+        await cur.execute('INSERT INTO messages (' + ','.join(cols) + ') VALUES (' +
+                          ','.join(['%s'] * len(cols)) +
+                          ') ON DUPLICATE KEY UPDATE archive_id=archive_id', tuple(row.values()))
+        inserted = cur.rowcount == 1
+        await cur.execute('SELECT text,text_hash,edited_at,sent_at FROM messages '
+                          'WHERE chat_id=%s AND message_id=%s FOR UPDATE',
+                          (row['chat_id'], row['message_id']))
+        old = await cur.fetchone()
+        incoming_version = row['edited_at'] or row['sent_at']
+        old_version = old['edited_at'] or old['sent_at']
+        if incoming_version > old_version or (incoming_version == old_version and
+                                               row.get('ingest_source') not in ('channel_history', 'chat_history')):
+            if old['text_hash'] != row['text_hash']:
+                await cur.execute('INSERT INTO message_revisions '
+                                  '(chat_id,message_id,text,text_hash,edited_at) VALUES (%s,%s,%s,%s,%s)',
+                                  (row['chat_id'], row['message_id'], old['text'], old['text_hash'], old['edited_at']))
+            mutable = [k for k in cols if k not in ('chat_id', 'message_id', 'ingest_source')]
+            await cur.execute('UPDATE messages SET ' + ','.join(k + '=%s' for k in mutable) +
+                              ' WHERE chat_id=%s AND message_id=%s',
+                              tuple(row[k] for k in mutable) + (row['chat_id'], row['message_id']))
+        return inserted
+
     async def save_row(self, row):
         """Atomic upsert. Old history must never overwrite a newer live edit."""
-        cols = list(row)
         async with self.pool.acquire() as conn:
             await conn.begin()
             try:
                 async with conn.cursor(DictCursor) as cur:
-                    await cur.execute('INSERT INTO messages (' + ','.join(cols) + ') VALUES (' +
-                                      ','.join(['%s'] * len(cols)) +
-                                      ') ON DUPLICATE KEY UPDATE archive_id=archive_id', tuple(row.values()))
-                    await cur.execute('SELECT text,text_hash,edited_at,sent_at FROM messages '
-                                      'WHERE chat_id=%s AND message_id=%s FOR UPDATE',
-                                      (row['chat_id'], row['message_id']))
-                    old = await cur.fetchone()
-                    incoming_version = row['edited_at'] or row['sent_at']
-                    old_version = old['edited_at'] or old['sent_at']
-                    if incoming_version >= old_version:
-                        if old['text_hash'] != row['text_hash']:
-                            await cur.execute('INSERT INTO message_revisions '
-                                              '(chat_id,message_id,text,text_hash,edited_at) VALUES (%s,%s,%s,%s,%s)',
-                                              (row['chat_id'], row['message_id'], old['text'], old['text_hash'], old['edited_at']))
-                        mutable = [k for k in cols if k not in ('chat_id', 'message_id', 'ingest_source')]
-                        await cur.execute('UPDATE messages SET ' + ','.join(k + '=%s' for k in mutable) +
-                                          ' WHERE chat_id=%s AND message_id=%s',
-                                          tuple(row[k] for k in mutable) + (row['chat_id'], row['message_id']))
+                    inserted = await self._save_row(cur, row)
+                await conn.commit()
+                return inserted
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    @staticmethod
+    async def _save_metrics(cur, chat_id, message_id, views=None, forwards=None, reactions=None, source='update'):
+        incoming = {key: value for key, value in dict(views=views, forwards=forwards,
+                    reactions=json_text(reactions)).items() if value is not None}
+        if not incoming:
+            return
+        await cur.execute('INSERT INTO message_metrics (chat_id,message_id) VALUES (%s,%s) '
+                          'ON DUPLICATE KEY UPDATE chat_id=chat_id', (chat_id, message_id))
+        await cur.execute('SELECT * FROM message_metrics WHERE chat_id=%s AND message_id=%s FOR UPDATE',
+                          (chat_id, message_id))
+        old = await cur.fetchone()
+        changed = any((json.loads(old[k]) if k == 'reactions' and isinstance(old[k], str) else old[k]) !=
+                      (json.loads(v) if k == 'reactions' else v) for k, v in incoming.items())
+        await cur.execute('UPDATE message_metrics SET ' + ','.join(k + '=%s' for k in incoming) +
+                          ',observed_at=UTC_TIMESTAMP(6) WHERE chat_id=%s AND message_id=%s',
+                          (*incoming.values(), chat_id, message_id))
+        if changed:
+            await cur.execute('INSERT INTO message_metric_history '
+                              '(chat_id,message_id,views,forwards,reactions,source) '
+                              'SELECT chat_id,message_id,views,forwards,reactions,%s FROM message_metrics '
+                              'WHERE chat_id=%s AND message_id=%s', (source, chat_id, message_id))
+
+    async def save_metrics(self, chat_id, message_id, **kwargs):
+        async with self.pool.acquire() as conn:
+            await conn.begin()
+            try:
+                async with conn.cursor(DictCursor) as cur:
+                    await self._save_metrics(cur, chat_id, message_id, **kwargs)
                 await conn.commit()
             except BaseException:
                 await conn.rollback()
                 raise
 
-    async def save_metrics(self, chat_id, message_id, views=None, forwards=None, reactions=None, source='update'):
-        incoming = {key: value for key, value in dict(views=views, forwards=forwards,
-                    reactions=json_text(reactions)).items() if value is not None}
-        if not incoming:
-            return
+    async def save_history_page(self, messages, account_id, chat_id, next_max_id, *, scope_key=None):
+        """Rows, media provenance, metrics and resume cursor commit together once per page."""
         async with self.pool.acquire() as conn:
             await conn.begin()
             try:
+                inserted = 0
                 async with conn.cursor(DictCursor) as cur:
-                    await cur.execute('INSERT INTO message_metrics (chat_id,message_id) VALUES (%s,%s) '
-                                      'ON DUPLICATE KEY UPDATE chat_id=chat_id', (chat_id, message_id))
-                    await cur.execute('SELECT * FROM message_metrics WHERE chat_id=%s AND message_id=%s FOR UPDATE',
-                                      (chat_id, message_id))
-                    old = await cur.fetchone()
-                    changed = any((json.loads(old[k]) if k == 'reactions' and isinstance(old[k], str) else old[k]) !=
-                                  (json.loads(v) if k == 'reactions' else v) for k, v in incoming.items())
-                    await cur.execute('UPDATE message_metrics SET ' + ','.join(k + '=%s' for k in incoming) +
-                                      ',observed_at=UTC_TIMESTAMP(6) WHERE chat_id=%s AND message_id=%s',
-                                      (*incoming.values(), chat_id, message_id))
-                    if changed:
-                        await cur.execute('INSERT INTO message_metric_history '
-                                          '(chat_id,message_id,views,forwards,reactions,source) '
-                                          'SELECT chat_id,message_id,views,forwards,reactions,%s FROM message_metrics '
-                                          'WHERE chat_id=%s AND message_id=%s', (source, chat_id, message_id))
+                    since = None
+                    allowed_type = 'channel'
+                    if scope_key is not None:
+                        await cur.execute('SELECT since_at,chat_type FROM scoped_channel_imports '
+                            'WHERE scope_key=%s AND account_id=%s AND chat_id=%s FOR UPDATE',
+                            (scope_key, account_id, chat_id))
+                        checkpoint = await cur.fetchone()
+                        if not checkpoint:
+                            raise ValueError('Channel is outside the import scope')
+                        since = checkpoint['since_at']
+                        allowed_type = checkpoint['chat_type']
+                    for msg in messages:
+                        if msg.empty:
+                            continue
+                        if not msg.chat or msg.chat.id != chat_id or kind(msg.chat.type) != allowed_type:
+                            raise ValueError('History page contains a different chat or a different chat type')
+                        if since is not None and (msg.date is None or utc(msg.date) < since):
+                            raise ValueError('Message is before the import start date')
+                        row = message_row(msg, account_id,
+                                          source='channel_history' if allowed_type == 'channel' else 'chat_history')
+                        inserted += await self._save_row(cur, row)
+                        await cur.execute('INSERT INTO message_sources '
+                            '(account_id,chat_id,message_id,media,outgoing,author_signature) '
+                            'VALUES (%s,%s,%s,%s,%s,%s) AS incoming '
+                            'ON DUPLICATE KEY UPDATE media=incoming.media,outgoing=incoming.outgoing,'
+                            'author_signature=incoming.author_signature,observed_at=UTC_TIMESTAMP(6)',
+                            (account_id, chat_id, msg.id, row['media'], row['outgoing'], row['author_signature']))
+                        await self._save_metrics(cur, chat_id, msg.id, views=msg.views, forwards=msg.forwards,
+                                                 reactions=reaction_counts(msg.reactions), source='channel_history')
+                    table = 'scoped_channel_imports' if scope_key is not None else 'channel_imports'
+                    where = 'scope_key=%s AND account_id=%s AND chat_id=%s' if scope_key is not None else \
+                            'account_id=%s AND chat_id=%s'
+                    identity = (scope_key, account_id, chat_id) if scope_key is not None else (account_id, chat_id)
+                    await cur.execute(f'UPDATE {table} SET next_max_id=%s,processed=processed+%s,'
+                        f'inserted=inserted+%s,updated_at=UTC_TIMESTAMP(6) WHERE {where}',
+                        (next_max_id, len(messages), inserted, *identity))
                 await conn.commit()
+                return inserted
             except BaseException:
                 await conn.rollback()
                 raise

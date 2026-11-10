@@ -45,7 +45,8 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         # All destructive cleanup is strictly within a freshly generated test database.
         admin('USE `' + TEST_DB + '`;' + ''.join('TRUNCATE TABLE ' + name + ';' for name in (
             'messages', 'message_revisions', 'message_embeddings', 'users', 'chats', 'chat_sync', 'unresolved_deletions',
-            'user_history', 'message_metrics', 'message_metric_history', 'collector_runs', 'collector_errors')))
+            'user_history', 'message_metrics', 'message_metric_history', 'collector_runs', 'collector_errors',
+            'channel_imports', 'message_sources', 'scoped_channel_imports')))
         index_path().unlink(missing_ok=True)
         self.writer = await Store.open()
         self.reader = await Store.open(readonly=True)
@@ -76,6 +77,70 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(Exception) as caught:
                 await self.reader.execute(sql)
             self.assertEqual(caught.exception.args[0], 1142)
+
+    async def test_history_same_version_preserves_live_media_and_source_account(self):
+        live = dict(row(), ingest_source='live', source_account_id=111,
+                    media_type='photo', media='{"file_id":"live-account-file"}')
+        self.assertTrue(await self.writer.save_row(live))
+        history = dict(live, ingest_source='channel_history', source_account_id=222,
+                       media='{"file_id":"history-account-file"}')
+        self.assertFalse(await self.writer.save_row(history))
+        saved = (await self.reader.query('SELECT * FROM messages'))[0]
+        self.assertEqual(saved['source_account_id'], 111)
+        self.assertEqual(saved['file_id'], 'live-account-file')
+        self.assertEqual(saved['ingest_source'], 'live')
+
+    async def test_import_page_rollback_resume_provenance_and_metrics(self):
+        await self.writer.execute('INSERT INTO channel_imports '
+            '(account_id,chat_id,upper_message_id,next_max_id) VALUES (77,-10001,10,10)')
+        channel = Chat(id=-10001, type=enums.ChatType.CHANNEL, title='Test')
+        good = Message(id=10, chat=channel, date=datetime(2026, 1, 1), text='Post', views=123,
+                       author_signature='Editor')
+        bad = Message(id=9, chat=Chat(id=-10002, type=enums.ChatType.CHANNEL), date=datetime(2026, 1, 1))
+        with self.assertRaises(ValueError):
+            await self.writer.save_history_page([good, bad], 77, -10001, 8)
+        self.assertEqual((await self.reader.query('SELECT COUNT(*) AS n FROM messages'))[0]['n'], 0)
+        state = (await self.reader.query('SELECT * FROM channel_imports WHERE account_id=77'))[0]
+        self.assertEqual(state['next_max_id'], 10)
+        self.assertEqual(await self.writer.save_history_page([good], 77, -10001, 9), 1)
+        self.assertEqual(await self.writer.save_history_page([good], 77, -10001, 9), 0)
+        self.assertEqual((await self.reader.query('SELECT COUNT(*) AS n FROM messages'))[0]['n'], 1)
+        self.assertEqual((await self.reader.query('SELECT * FROM message_sources WHERE account_id=77'))[0]['author_signature'], 'Editor')
+        self.assertEqual((await self.reader.query('SELECT * FROM message_metrics'))[0]['views'], 123)
+
+    async def test_scoped_import_rejects_old_posts_and_unlisted_channels_atomically(self):
+        scope = 'a' * 64
+        await self.writer.execute('INSERT INTO scoped_channel_imports '
+            '(scope_key,account_id,chat_id,target_username,since_at,upper_message_id,next_max_id) '
+            "VALUES (%s,77,-10001,'allowed','2025-01-01',10,10)", (scope,))
+        channel = Chat(id=-10001, type=enums.ChatType.CHANNEL, title='Allowed')
+        good = Message(id=10, chat=channel, date=datetime(2025, 1, 1), text='Allowed')
+        old = Message(id=9, chat=channel, date=datetime(2024, 12, 31), text='Too old')
+        with self.assertRaises(ValueError):
+            await self.writer.save_history_page([good, old], 77, -10001, 8, scope_key=scope)
+        self.assertEqual((await self.reader.query('SELECT COUNT(*) AS n FROM messages'))[0]['n'], 0)
+        with self.assertRaises(ValueError):
+            await self.writer.save_history_page([], 77, -10002, 0, scope_key=scope)
+        self.assertEqual(await self.writer.save_history_page([good], 77, -10001, 9, scope_key=scope), 1)
+        state = (await self.reader.query('SELECT * FROM scoped_channel_imports'))[0]
+        self.assertEqual(state['processed'], 1)
+        self.assertEqual(state['next_max_id'], 9)
+        self.assertEqual((await self.reader.query('SELECT COUNT(*) AS n FROM channel_imports'))[0]['n'], 0)
+
+    async def test_group_import_is_rejected_by_channel_scope_and_allowed_by_explicit_group_scope(self):
+        scope = 'b' * 64
+        await self.writer.execute('INSERT INTO scoped_channel_imports '
+            '(scope_key,account_id,chat_id,target_username,since_at,upper_message_id,next_max_id) '
+            "VALUES (%s,77,-10055,'id:-10055','2026-09-09',10,10)", (scope,))
+        group = Chat(id=-10055, type=enums.ChatType.SUPERGROUP, title='Allowed group')
+        msg = Message(id=10, chat=group, date=datetime(2026, 11, 9), text='Group post', reply_to_message_id=9)
+        with self.assertRaises(ValueError):
+            await self.writer.save_history_page([msg], 77, -10055, 9, scope_key=scope)
+        await self.writer.execute("UPDATE scoped_channel_imports SET chat_type='supergroup' WHERE scope_key=%s", (scope,))
+        self.assertEqual(await self.writer.save_history_page([msg], 77, -10055, 9, scope_key=scope), 1)
+        stored = (await self.reader.query('SELECT * FROM messages'))[0]
+        self.assertEqual(stored['ingest_source'], 'chat_history')
+        self.assertEqual(stored['reply_to_message_id'], 9)
 
     async def test_filters_fulltext_and_injection_literal(self):
         await self.writer.save_row(row(text='ремонт велосипеда завтра'))
