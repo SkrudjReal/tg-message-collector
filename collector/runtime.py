@@ -7,7 +7,7 @@ from pyrogram import Client, enums, filters, idle, raw, utils
 from pyrogram.errors import FloodWait, RPCError
 from pyrogram.handlers import MessageHandler, EditedMessageHandler, RawUpdateHandler
 
-from collector.config import DATA, MODEL, chat_ids
+from collector.config import DATA, chat_ids, active_profile
 from collector.storage import Store, reaction_counts
 from collector.search import Encoder
 from collector.vector_index import IndexWriter
@@ -124,35 +124,39 @@ async def handle_raw_update(store, update, queue_profile, allowed):
 
 
 async def embedding_loop(store, once=False):
-    encoder = Encoder()
-    index = IndexWriter()
-    await index.refresh(store)
-    while True:
-        rows = await store.query('SELECT m.archive_id,m.text,m.text_hash FROM messages m '
-                                 'LEFT JOIN message_embeddings e ON e.archive_id=m.archive_id '
-                                 "WHERE m.text<>'' "
-                                 'AND (e.archive_id IS NULL OR e.text_hash<>m.text_hash OR e.model<>%s) '
-                                 'ORDER BY m.archive_id LIMIT 64', (MODEL,))
-        if not rows:
-            await index.refresh(store, force=True)
-            if once:
-                return
-            await asyncio.sleep(10)
-            continue
-        vectors = await encoder.encode([r['text'] for r in rows])
-        for row, vector in zip(rows, vectors):
-            await store.execute('INSERT INTO message_embeddings (archive_id,model,text_hash,vector) '
-                                'VALUES (%s,%s,%s,%s) AS incoming ON DUPLICATE KEY UPDATE model=incoming.model,'
-                                'text_hash=incoming.text_hash,vector=incoming.vector,updated_at=UTC_TIMESTAMP(6)',
-                                (row['archive_id'], MODEL, row['text_hash'], vector.astype('<f4').tobytes()))
-        log.info('Embedded %s messages locally', len(rows))
+    from collector.embedding_jobs import missing_rows, save_vectors, provider_lock
+    profile = active_profile()
+    with provider_lock(profile):
+        encoder = Encoder(profile)
+        index = IndexWriter(profile)
         await index.refresh(store)
+        while True:
+            if active_profile() != profile:
+                return  # supervisor is restarted below on provider change
+            rows = await missing_rows(store, profile)
+            if not rows:
+                await index.refresh(store, force=True)
+                if once:
+                    return
+                await asyncio.sleep(10)
+                continue
+            from collector.cloudflare import CloudflareLimitError
+            try:
+                vectors = await encoder.encode([r['text'] for r in rows])
+            except CloudflareLimitError:
+                if once:
+                    raise
+                await asyncio.sleep(60)
+                continue
+            await save_vectors(store, profile, rows, vectors)
+            await index.refresh(store)
 
 
 async def supervise(name, factory, store):
     while True:
         try:
             await factory()
+            await asyncio.sleep(1)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -224,8 +228,9 @@ async def run(args):
         ready.set()
         tasks = [asyncio.create_task(supervise('profiles', lambda: profile_loop(
                      app, store, profile_queue, pending_profiles), store)),
-                 asyncio.create_task(supervise('embeddings', lambda: embedding_loop(store), store)),
                  asyncio.create_task(supervise('heartbeat', lambda: heartbeat_loop(store), store))]
+        if os.getenv('EMBEDDING_WORKER_ENABLED', 'true').lower() == 'true':
+            tasks.append(asyncio.create_task(supervise('embeddings', lambda: embedding_loop(store), store)))
         log.info('Collector running for user %s', own_id)
         await idle()
     finally:

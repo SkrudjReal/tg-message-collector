@@ -23,6 +23,7 @@ from collector.storage import Store, message_row, utc  # noqa: E402
 from collector.search import Search  # noqa: E402
 from collector.runtime import embedding_loop  # noqa: E402
 from collector.vector_index import index_path  # noqa: E402
+from collector.config import active_profile_path, EmbeddingProfile, active_profile  # noqa: E402
 from pyrogram import enums  # noqa: E402
 from pyrogram.types import Message, Chat, User  # noqa: E402
 
@@ -48,6 +49,9 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
             'user_history', 'message_metrics', 'message_metric_history', 'collector_runs', 'collector_errors',
             'channel_imports', 'message_sources', 'scoped_channel_imports')))
         index_path().unlink(missing_ok=True)
+        index_path(EmbeddingProfile('cloudflare')).unlink(missing_ok=True)
+        active_profile_path().unlink(missing_ok=True)
+        admin(f'USE `{TEST_DB}`; TRUNCATE TABLE cloudflare_embeddings; TRUNCATE TABLE embedding_jobs;')
         self.writer = await Store.open()
         self.reader = await Store.open(readonly=True)
         self.search = Search(self.reader)
@@ -55,6 +59,84 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.writer.close()
         await self.reader.close()
+        active_profile_path().unlink(missing_ok=True)
+
+    async def test_hybrid_search_includes_unembedded_messages_and_applies_topic_filter(self):
+        await self.writer.save_row(row(text='Нужно починить велосипед, сломалось колесо.'))
+        await self.writer.save_row(row(chat_id=-10002, text='Банковский кредит.'))
+        await embedding_loop(self.writer, once=True)
+        fresh = row(message_id=3, text='Новый велосипед без эмбеддинга')
+        fresh['topic_id'] = 7
+        await self.writer.save_row(fresh)
+        result = await self.search.hybrid('велосипед', chat_id=-10001)
+        self.assertEqual({r['message_id'] for r in result['messages']}, {1, 3})
+        self.assertTrue(all(r['chat_id'] == -10001 for r in result['messages']))
+        self.assertEqual(result['warnings'], [])
+        fresh_result = next(r for r in result['messages'] if r['message_id'] == 3)
+        self.assertEqual(fresh_result['matched_by'], ['fulltext'])
+        result = await self.search.hybrid('велосипед', chat_id=-10001, topic_id=7)
+        self.assertEqual([r['message_id'] for r in result['messages']], [3])
+
+    async def test_cloudflare_reindex_resume_edits_atomic_switch_and_rollback(self):
+        from unittest.mock import patch
+        import numpy as np
+        from collector.embedding_jobs import reindex, validate_and_activate
+        from collector.vector_index import IndexWriter
+        from collector.search import Encoder
+
+        for number in range(1, 66):
+            await self.writer.save_row(row(message_id=number, text=f'Synthetic fixture {number}'))
+        await embedding_loop(self.writer, once=True)
+        local_before = (await self.reader.query('SELECT COUNT(*) AS n FROM message_embeddings'))[0]['n']
+        local = EmbeddingProfile('local')
+        cloud = EmbeddingProfile('cloudflare')
+
+        async def fake_cloud(encoder, texts, **kwargs):
+            self.assertEqual(encoder.profile, cloud)
+            vectors = np.zeros((len(texts), 1024), dtype='<f4')
+            vectors[:, 0] = 1
+            return vectors
+
+        with patch.dict(os.environ, CF_ALLOW_REAL_MESSAGES='true'), patch.object(Encoder, 'encode', fake_cloud):
+            result = await reindex(self.writer, cloud, max_batches=1)
+            self.assertEqual(result['status'], 'paused')
+            self.assertEqual(active_profile(), local)
+            await self.writer.save_row(row(message_id=1, text='Changed synthetic fixture'))
+            with self.assertRaises(RuntimeError):
+                await validate_and_activate(self.writer, cloud, 999999)
+            result = await reindex(self.writer, cloud, activate=True)
+            self.assertEqual(result['provider'], 'cloudflare')
+            self.assertEqual(active_profile(), cloud)
+            self.assertEqual((await self.reader.query('SELECT COUNT(*) AS n FROM message_embeddings'))[0]['n'],
+                             local_before)
+            result = await self.search.semantic('Synthetic query')
+            self.assertEqual(result['model'], cloud.model)
+            self.assertTrue(result['messages'])
+        # Repair the changed local text, then switch back; no cloud request is made for rollback.
+        active_profile_path().unlink()
+        await embedding_loop(self.writer, once=True)
+        await IndexWriter(local).refresh(self.writer, force=True)
+        await validate_and_activate(self.writer, local, 999999)
+        self.assertEqual(active_profile(), local)
+
+    async def test_cloudflare_failure_preserves_messages_and_local_vectors(self):
+        from unittest.mock import patch
+        from collector.embedding_jobs import reindex
+        from collector.cloudflare import CloudflareError
+        from collector.search import Encoder
+        await self.writer.save_row(row(text='Synthetic preservation fixture'))
+        await embedding_loop(self.writer, once=True)
+        before_messages = await self.reader.query('SELECT * FROM messages')
+        before_vectors = await self.reader.query('SELECT * FROM message_embeddings')
+        async def failure(*args, **kwargs):
+            raise CloudflareError('Synthetic API failure')
+        with patch.dict(os.environ, CF_ALLOW_REAL_MESSAGES='true'), patch.object(Encoder, 'encode', failure):
+            with self.assertRaises(CloudflareError):
+                await reindex(self.writer, EmbeddingProfile('cloudflare'))
+        self.assertEqual(await self.reader.query('SELECT * FROM messages'), before_messages)
+        self.assertEqual(await self.reader.query('SELECT * FROM message_embeddings'), before_vectors)
+        self.assertEqual((await self.reader.query('SELECT COUNT(*) AS n FROM cloudflare_embeddings'))[0]['n'], 0)
+        self.assertEqual(active_profile().provider, 'local')
 
     async def test_composite_identity_and_no_duplicates(self):
         await self.writer.save_row(row())
@@ -340,7 +422,7 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
                         async with ClientSession(read, write) as session:
                             await session.initialize()
                             tools = (await session.list_tools()).tools
-                            self.assertEqual({t.name for t in tools}, {'search_messages', 'semantic_search',
+                            self.assertEqual({t.name for t in tools}, {'search', 'search_messages', 'semantic_search',
                                              'get_message', 'list_users', 'list_chats', 'archive_status',
                                              'get_user_history', 'get_message_metrics', 'get_statistics', 'get_activity',
                                              'get_top_words', 'get_top_phrases', 'get_top_mentions', 'get_top_authors',
@@ -350,6 +432,9 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
                             result = await session.call_tool('search_messages', {'chat_id': -10001})
                             self.assertFalse(result.isError)
                             self.assertIn('Тестовое сообщение', result.content[0].text)
+                            hybrid = await session.call_tool('search', {'query': 'Тестовое', 'chat_id': -10001})
+                            self.assertFalse(hybrid.isError)
+                            self.assertIn('Тестовое сообщение', hybrid.content[0].text)
                             status = await session.call_tool('archive_status', {})
                             self.assertFalse(status.isError)
                             import json
@@ -377,6 +462,8 @@ if __name__ == '__main__':
         program = unittest.main(exit=False)
     finally:
         index_path().unlink(missing_ok=True)
+        index_path(EmbeddingProfile('cloudflare')).unlink(missing_ok=True)
+        active_profile_path().unlink(missing_ok=True)
         admin(f'DROP DATABASE `{TEST_DB}`;'
               f"REVOKE ALL PRIVILEGES ON `{TEST_DB}`.* FROM 'tg_collector'@'127.0.0.1';"
               f"REVOKE ALL PRIVILEGES ON `{TEST_DB}`.* FROM 'tg_reader'@'127.0.0.1';")

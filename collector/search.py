@@ -5,7 +5,7 @@ import threading
 import numpy as np
 from asyncmy.cursors import SSDictCursor
 
-from collector.config import DATA, MODEL
+from collector.config import DATA, MODEL, active_profile, EmbeddingProfile
 from collector.vector_index import IndexReader
 
 _MODEL_REGISTRATION_LOCK = threading.Lock()
@@ -29,7 +29,8 @@ def embedding_model():
 
 
 class Encoder:
-    def __init__(self):
+    def __init__(self, profile=None):
+        self.profile = profile or EmbeddingProfile()
         self.model = None
         self.lock = asyncio.Lock()
 
@@ -40,8 +41,11 @@ class Encoder:
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         return vectors / np.maximum(norms, 1e-12)
 
-    async def encode(self, texts):
+    async def encode(self, texts, *, synthetic=False):
         async with self.lock:
+            if self.profile.provider == 'cloudflare':
+                from collector.cloudflare import CloudflareEncoder
+                return await CloudflareEncoder().encode(texts, synthetic=synthetic)
             return await asyncio.to_thread(self._encode, texts)
 
 
@@ -63,10 +67,60 @@ def bounded_limit(limit, maximum=200):
 
 
 class Search:
-    def __init__(self, store):
+    def __init__(self, store, profile=None):
         self.store = store
-        self.encoder = Encoder()
-        self.index = IndexReader()
+        self.fixed = profile is not None
+        self.profile = profile or active_profile()
+        self.encoder = Encoder(self.profile)
+        self.index = IndexReader(self.profile)
+        self.current = None
+
+    async def hybrid(self, query, limit=20, candidate_limit=50000, **kwargs):
+        bounded_limit(limit, 100)
+        bounded_limit(candidate_limit, 200000)
+        if not query.strip() or len(query) > 2000:
+            raise ValueError('query must contain 1..2000 characters')
+        clauses, params = filters(**kwargs)
+        clauses.append('MATCH(m.text) AGAINST (%s IN NATURAL LANGUAGE MODE)')
+        # Rank lexical candidates by relevance, rather than message date.
+        lexical = await self.store.query(
+            'SELECT m.*,MATCH(m.text) AGAINST (%s IN NATURAL LANGUAGE MODE) AS lexical_score '
+            'FROM messages m WHERE ' + ' AND '.join(clauses) +
+            ' ORDER BY lexical_score DESC,m.sent_at DESC,m.archive_id DESC LIMIT %s',
+            (query, *params, query, 100),
+        )
+        warnings = []
+        try:
+            semantic = await asyncio.wait_for(
+                self.semantic(query, limit=100, candidate_limit=candidate_limit, **kwargs), timeout=60,
+            )
+        except Exception as exc:
+            # Keyword search remains usable while a model/provider is unavailable.
+            semantic = dict(messages=[], truncated=True)
+            warnings.append(dict(component='semantic', error_type=type(exc).__name__))
+        merged = {}
+        for source, rows in [('fulltext', lexical), ('semantic', semantic['messages'])]:
+            seen = set()
+            for rank, row in enumerate(rows, 1):
+                key = row['archive_id']
+                if key in seen:
+                    continue
+                seen.add(key)
+                if key not in merged:
+                    merged[key] = dict(row, matched_by=[], hybrid_score=0.0)
+                item = merged[key]
+                if 'similarity' in row:
+                    item['similarity'] = row['similarity']
+                item['matched_by'].append(source)
+                # Reciprocal rank fusion avoids mixing incompatible score scales.
+                item['hybrid_score'] += 1 / (60 + rank)
+        ranked = sorted(merged.values(), key=lambda row: (-row['hybrid_score'], row['archive_id']))
+        return dict(messages=ranked[:limit], mode='hybrid', ranking='reciprocal_rank_fusion',
+                    candidates=dict(fulltext=len(lexical), semantic=len(semantic['messages'])),
+                    truncated=bool(semantic.get('truncated')) or len(lexical) == 100 or len(ranked) > limit,
+                    semantic_coverage={key: semantic[key] for key in
+                                       ('model', 'scanned', 'indexed_vectors', 'approximate', 'note') if key in semantic},
+                    warnings=warnings, note='hybrid_score is a ranking score, not a probability.')
 
     async def messages(self, query=None, mode='fulltext', limit=50, before_date=None,
                        before_chat_id=None, before_message_id=None, **kwargs):
@@ -98,6 +152,11 @@ class Search:
                     before_message_id=last['message_id']) if last and len(rows) == limit else None)
 
     async def semantic(self, query, limit=20, candidate_limit=50000, **kwargs):
+        if not self.fixed:
+            profile = active_profile()
+            if self.current is None or self.current.profile != profile:
+                self.current = Search(self.store, profile)
+            return await self.current.semantic(query, limit, candidate_limit, **kwargs)
         bounded_limit(limit, 100)
         bounded_limit(candidate_limit, 200000)
         if not query.strip() or len(query) > 2000:
@@ -109,9 +168,9 @@ class Search:
                 return ann
         clauses, params = filters(**kwargs)
         clauses += ['e.model=%s', 'e.text_hash=m.text_hash']
-        params.append(MODEL)
-        sql = ('SELECT m.archive_id,e.vector FROM messages m JOIN message_embeddings e '
-               'ON e.archive_id=m.archive_id WHERE ' + ' AND '.join(clauses) +
+        params.append(self.profile.model)
+        sql = (f'SELECT m.archive_id,e.vector FROM messages m JOIN {self.profile.table} e '
+               f'ON e.archive_id=m.archive_id WHERE ' + ' AND '.join(clauses) +
                ' ORDER BY m.sent_at DESC,m.chat_id DESC,m.message_id DESC LIMIT %s')
         heap, scanned = [], 0
         async with self.store.pool.acquire() as conn, conn.cursor(SSDictCursor) as cur:
@@ -136,15 +195,15 @@ class Search:
                         note='No current embeddings match. Run the embedding worker and check archive_status.')
         ids = [item[1] for item in ranked]
         # Recheck currentness after scoring in case a live edit happened concurrently.
-        rows = await self.store.query('SELECT m.* FROM messages m JOIN message_embeddings e '
-                                      'ON e.archive_id=m.archive_id WHERE e.text_hash=m.text_hash '
+        rows = await self.store.query(f'SELECT m.* FROM messages m JOIN {self.profile.table} e '
+                                      'ON e.archive_id=m.archive_id WHERE e.text_hash=m.text_hash AND e.model=%s '
                                       'AND m.archive_id IN (' +
-                                      ','.join(['%s'] * len(ids)) + ')', tuple(ids))
+                                      ','.join(['%s'] * len(ids)) + ')', (self.profile.model, *ids))
         by_id = {row['archive_id']: row for row in rows}
         return dict(messages=[dict(by_id[i], similarity=score) for score, i in ranked if i in by_id],
                     scanned=min(scanned, candidate_limit), truncated=scanned > candidate_limit,
                     candidate_order='newest first; filter by chat/user/date for larger archives',
-                    approximate=False, model=MODEL)
+                    approximate=False, model=self.profile.model)
 
     async def semantic_ann(self, vector, limit, candidate_limit):
         count = min(max(limit * 8, 100), candidate_limit)
@@ -155,10 +214,10 @@ class Search:
             ids, size, stamp = result
             if not ids:
                 return dict(messages=[], approximate=True, indexed_vectors=size, truncated=False)
-            rows = await self.store.query('SELECT m.*,e.vector FROM messages m JOIN message_embeddings e '
-                                          'ON e.archive_id=m.archive_id WHERE '
+            rows = await self.store.query(f'SELECT m.*,e.vector FROM messages m JOIN {self.profile.table} e '
+                                          f'ON e.archive_id=m.archive_id WHERE '
                                           'e.text_hash=m.text_hash AND e.model=%s AND m.archive_id IN (' +
-                                          ','.join(['%s'] * len(ids)) + ')', (MODEL, *ids))
+                                          ','.join(['%s'] * len(ids)) + ')', (self.profile.model, *ids))
             # Score using current SQL vectors, even if an edit occurred since the ANN snapshot.
             for row in rows:
                 row['similarity'] = float(np.frombuffer(row.pop('vector'), dtype='<f4') @ vector)
@@ -166,5 +225,5 @@ class Search:
             if len(rows) >= limit or count >= min(size, candidate_limit):
                 return dict(messages=rows[:limit], approximate=True, indexed_vectors=size,
                             candidates=len(ids), truncated=len(rows) < limit and count < size,
-                            snapshot_mtime_ns=stamp, model=MODEL)
+                            snapshot_mtime_ns=stamp, model=self.profile.model)
             count = min(count * 2, size, candidate_limit)
