@@ -20,17 +20,20 @@ search = None
 @asynccontextmanager
 async def lifespan(_):
     global store, search
-    store = await Store.open(readonly=True)
-    search = Search(store)
+    opened_store = await Store.open(readonly=True)
     try:
+        store = opened_store
+        search = Search(opened_store)
         yield {}
     finally:
-        await store.close()
+        search = None
+        store = None
+        await opened_store.close()
 
 
 port = int(os.getenv('MCP_PORT', '8765'))
 mcp = FastMCP('tg-message-collector', host='127.0.0.1', port=port,
-              lifespan=lifespan, stateless_http=True, json_response=True,
+              stateless_http=True, json_response=True,
               transport_security=TransportSecuritySettings(
                   enable_dns_rebinding_protection=True,
                   allowed_hosts=[f'127.0.0.1:{port}', f'localhost:{port}'],
@@ -230,13 +233,28 @@ async def archive_status(after_chat_id: int | None = None, limit: int = 50) -> d
 register_analytics(mcp, lambda: store, READ)
 
 
+def create_http_app():
+    app = mcp.streamable_http_app()
+    transport_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def process_lifespan(app):
+        # FastMCP's lifespan runs per stateless request; resources belong to ASGI startup.
+        async with lifespan(app):
+            async with transport_lifespan(app):
+                yield
+
+    app.router.lifespan_context = process_lifespan
+    return app
+
+
 def main():
     os.umask(0o077)
     import uvicorn
     token = os.environ.get('MCP_TOKEN', '')
     if not token:
         raise RuntimeError('Set a random MCP_TOKEN in .env before starting the server')
-    app = mcp.streamable_http_app()
+    app = create_http_app()
 
     class BearerOnly:
         async def __call__(self, scope, receive, send):
