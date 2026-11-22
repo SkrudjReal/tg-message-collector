@@ -275,7 +275,7 @@ class Analytics:
             'ORDER BY messages DESC,m.sender_user_id,m.sender_chat_id LIMIT %s', params + (limit,))
         for r in rows:
             r['percent'] = round(r['messages'] * 100 / total['messages'], 2)
-            profiles = await self.store.query('SELECT user_id,username,first_name,last_name FROM users WHERE user_id=%s',
+            profiles = await self.store.query('SELECT user_id,username,first_name,last_name,is_bot FROM users WHERE user_id=%s',
                                              (r['sender_user_id'],)) if r['sender_user_id'] else []
             r['profile'] = profiles[0] if profiles else None
         return dict(authors=rows, metadata=metadata(scope, matching_messages=total['messages'],

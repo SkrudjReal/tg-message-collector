@@ -9,6 +9,15 @@ the existing archive and index format are unchanged.
 Parameters: `query` (1–2000 nonblank characters), `limit` (1–100), optional
 `chat_id`, `sender_user_id`, `sender_chat_id`, UTC `since`/`until`, and `topic_id`.
 `candidate_limit` bounds the semantic scan (default 50,000, maximum 200,000).
+All three search tools accept `exclude_chat_id` to exclude a chat in SQL before
+candidate selection and ranking, including chronological history browsing.
+
+`public_only=true` restricts all three search tools to archived groups,
+supergroups and channels (negative chat IDs and matching `chats.type`). It is
+applied in SQL before lexical ranking and semantic candidate scoring, not as
+post-filtering. Omit `chat_id` to search across these chats in one request.
+Like other semantic filters, this uses a bounded recent-vector scan; inspect
+coverage and `truncated` rather than assuming the entire archive was scanned.
 
 Results include `matched_by`, `hybrid_score`, optional cosine `similarity`,
 source candidate counts, semantic coverage metadata, `truncated`, and `warnings`.

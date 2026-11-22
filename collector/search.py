@@ -49,9 +49,13 @@ class Encoder:
             return await asyncio.to_thread(self._encode, texts)
 
 
-def filters(chat_id=None, sender_user_id=None, sender_chat_id=None, since=None, until=None, topic_id=None):
+def filters(chat_id=None, sender_user_id=None, sender_chat_id=None, since=None, until=None, topic_id=None,
+            public_only=False, exclude_chat_id=None):
     clauses, params = [], []
-    for name, value, op in [('chat_id', chat_id, '='), ('sender_user_id', sender_user_id, '='),
+    if public_only:
+        clauses.append("m.chat_id<0 AND EXISTS (SELECT 1 FROM chats c WHERE c.chat_id=m.chat_id "
+                       "AND c.type IN ('group','supergroup','channel'))")
+    for name, value, op in [('chat_id', chat_id, '='), ('chat_id', exclude_chat_id, '<>'), ('sender_user_id', sender_user_id, '='),
                             ('sender_chat_id', sender_chat_id, '='), ('sent_at', since, '>='),
                             ('sent_at', until, '<'), ('topic_id', topic_id, '=')]:
         if value is not None:

@@ -51,11 +51,13 @@ READ = {'readOnlyHint': True, 'destructiveHint': False, 'idempotentHint': True, 
 async def search_archive(query: str, chat_id: int | None = None, sender_user_id: int | None = None,
                          sender_chat_id: int | None = None, since: datetime | None = None,
                          until: datetime | None = None, topic_id: int | None = None,
-                         limit: int = 20, candidate_limit: int = 50000) -> dict:
+                         limit: int = 20, candidate_limit: int = 50000, public_only: bool = False,
+                         exclude_chat_id: int | None = None) -> dict:
     """Основной поиск сообщений: слова + смысл, без дублей, с фильтрами чата, автора, дат и темы. Проверяйте warnings и truncated."""
     return await search.hybrid(query, limit=limit, candidate_limit=candidate_limit,
                                chat_id=chat_id, sender_user_id=sender_user_id, sender_chat_id=sender_chat_id,
-                               since=utc(since), until=utc(until), topic_id=topic_id)
+                               since=utc(since), until=utc(until), topic_id=topic_id, public_only=public_only,
+                               exclude_chat_id=exclude_chat_id)
 
 
 @mcp.tool(annotations=READ)
@@ -64,23 +66,27 @@ async def search_messages(query: str | None = None, chat_id: int | None = None,
                           since: datetime | None = None, until: datetime | None = None,
                           mode: str = 'fulltext', limit: int = 50,
                           topic_id: int | None = None, before_date: datetime | None = None,
-                          before_chat_id: int | None = None, before_message_id: int | None = None) -> dict:
+                          before_chat_id: int | None = None, before_message_id: int | None = None,
+                          public_only: bool = False, exclude_chat_id: int | None = None) -> dict:
     """Поиск по словам, чату, автору, датам и теме. FULLTEXT или substring; для пагинации передайте все поля next_cursor."""
     return await search.messages(query=query, mode=mode, limit=limit, chat_id=chat_id,
                                   sender_user_id=sender_user_id, sender_chat_id=sender_chat_id,
                                   since=utc(since), until=utc(until),
                                   topic_id=topic_id, before_date=utc(before_date),
-                                  before_chat_id=before_chat_id, before_message_id=before_message_id)
+                                  before_chat_id=before_chat_id, before_message_id=before_message_id,
+                                  public_only=public_only, exclude_chat_id=exclude_chat_id)
 
 
 @mcp.tool(annotations=READ)
 async def semantic_search(query: str, chat_id: int | None = None, sender_user_id: int | None = None,
                           sender_chat_id: int | None = None, since: datetime | None = None,
-                          until: datetime | None = None, limit: int = 20, candidate_limit: int = 50000) -> dict:
+                          until: datetime | None = None, limit: int = 20, candidate_limit: int = 50000,
+                          public_only: bool = False, exclude_chat_id: int | None = None) -> dict:
     """Поиск по смыслу: HNSW без фильтров, точное сравнение ограниченной выборки с фильтрами. Проверяйте truncated и покрытие."""
     return await search.semantic(query, limit=limit, candidate_limit=candidate_limit,
                                   chat_id=chat_id, sender_user_id=sender_user_id,
-                                  sender_chat_id=sender_chat_id, since=utc(since), until=utc(until))
+                                  sender_chat_id=sender_chat_id, since=utc(since), until=utc(until),
+                                  public_only=public_only, exclude_chat_id=exclude_chat_id)
 
 
 @mcp.tool(annotations=READ)
