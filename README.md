@@ -2,96 +2,96 @@
 
 # ✦ TG Message Collector
 
-Локальный архив Telegram · MySQL 8 · поиск по словам и смыслу · MCP только для чтения
+Local Telegram archive · MySQL 8 · lexical and semantic search · read-only MCP
 
 [![Issues](https://img.shields.io/github/issues/SkrudjReal/tg-message-collector?style=for-the-badge&color=f0abfc&labelColor=19152e)](https://github.com/SkrudjReal/tg-message-collector/issues)
 [![Pull requests](https://img.shields.io/github/issues-pr/SkrudjReal/tg-message-collector?style=for-the-badge&color=a5b4fc&labelColor=19152e)](https://github.com/SkrudjReal/tg-message-collector/pulls)
 [![Stars](https://img.shields.io/github/stars/SkrudjReal/tg-message-collector?style=for-the-badge&color=c4b5fd&labelColor=19152e)](https://github.com/SkrudjReal/tg-message-collector/stargazers)
 [![Forks](https://img.shields.io/github/forks/SkrudjReal/tg-message-collector?style=for-the-badge&color=a5b4fc&labelColor=19152e)](https://github.com/SkrudjReal/tg-message-collector/forks)
 
-[Запуск](#запуск) · [Возможности](#возможности) · [MCP-инструменты](#mcp-инструменты) · [Документация](docs/operations.md) · [Сообщить о проблеме](https://github.com/SkrudjReal/tg-message-collector/issues/new)
+[Getting started](#getting-started) · [Features](#features) · [MCP tools](#mcp-tools) · [Documentation](docs/operations.md) · [Report an issue](https://github.com/SkrudjReal/tg-message-collector/issues/new)
 
 </div>
 
-## Возможности
+## Features
 
-| Часть | Реализация |
+| Component | Implementation |
 | :--- | :--- |
-| Telegram | Kurigram / MTProto, отдельная сессия, только новые события из хендлеров, без загрузки истории |
-| Архив | Группы и каналы, пользователи и био, авторы, replies, темы, пересылки, метаданные медиа |
-| Аналитика | [Статистика, активность, топы слов и сочетаний, собеседники по reply, история профилей и правок](docs/analytics.md) |
-| Изменения | Предыдущий текст правок, защита от дублей; удаление в Telegram не влияет на архив |
-| Разовый импорт | Явные ссылки на каналы или ID супергруппы, нижняя граница даты, контрольные точки и проверка области импорта в MySQL |
-| Поиск | Индексы чата/автора/даты, MySQL FULLTEXT, буквальная подстрока, локальные multilingual embeddings |
-| Семантика | USearch f32, локальная MiniLM или [Cloudflare BGE-M3](docs/cloudflare-embeddings.md); раздельные поколения и проверяемое переключение |
-| MCP | `http://127.0.0.1:8765/mcp`, Bearer token, отдельный MySQL-пользователь с `SELECT` |
+| Telegram | Kurigram / MTProto, a separate session, only new events from handlers, no history fetching |
+| Archive | Groups and channels, users and bios, authors, replies, topics, forwards, media metadata |
+| Analytics | [Statistics, activity, top words and phrases, reply partners, profile and edit history](docs/analytics.md) |
+| Changes | Previous versions of edited text, deduplication; deletion in Telegram does not affect the archive |
+| One-time import | Explicit channel links or supergroup IDs, a start date, checkpoints, and import-scope verification in MySQL |
+| Search | Chat/author/date indexes, MySQL FULLTEXT, literal substrings, local multilingual embeddings |
+| Semantics | USearch f32, local MiniLM or [Cloudflare BGE-M3](docs/cloudflare-embeddings.md); separate generations and verifiable switching |
+| MCP | `http://127.0.0.1:8765/mcp`, Bearer token, a separate MySQL user with `SELECT` |
 
-## MCP-инструменты
+## MCP tools
 
-Сервер предоставляет **20 инструментов только для чтения**. Они работают с сохранённым
-архивом MySQL и не запрашивают Telegram. Адрес по умолчанию:
-`http://127.0.0.1:8765/mcp`, авторизация — `Authorization: Bearer <MCP_TOKEN>`.
+The server provides **20 read-only tools**. They query the stored
+MySQL archive without requesting data from Telegram. Default address:
+`http://127.0.0.1:8765/mcp`, authentication: `Authorization: Bearer <MCP_TOKEN>`.
 
-Для поиска сообщений начинайте с [`search`](docs/search.md): он объединяет слова
-и смысл. Статистика и история по-прежнему доступны отдельными инструментами.
+For message search, start with [`search`](docs/search.md): it combines lexical
+and semantic search. Statistics and history remain available through separate tools.
 
-| Инструмент | Назначение |
+| Tool | Purpose |
 | :--- | :--- |
-| `search` | Основной поиск: FULLTEXT + смысл, объединение без дублей, фильтры и явные предупреждения |
-| `search_messages` | Поиск по словам или подстроке, чату, автору, датам и теме; пагинация |
-| `semantic_search` | Поиск по смыслу с фильтрами и показателями покрытия индекса |
-| `list_users` | Текущие профили: ID, username, имя и био |
-| `list_chats` | Список и метаданные сохранённых групп и каналов |
-| `get_message` | Сообщение, соседний контекст, reply, file_id медиа и источники |
-| `get_user_history` | Текущий профиль и общая история имени, username и био |
-| `get_message_history` | Текущий текст сообщения и сохранённые версии правок |
-| `get_message_metrics` | История наблюдённых просмотров, пересылок и реакций |
-| `get_statistics` | Число сообщений, авторов, replies, правок, медиа и длина текста |
-| `get_activity` | Активность по часам, дням, неделям и месяцам с часовым поясом |
-| `get_top_words` | Топ слов: употребления, число сообщений и примеры; русские леммы опциональны |
-| `get_top_phrases` | Топ словосочетаний из 2–5 последовательных слов |
-| `get_top_mentions` | Частые буквальные @упоминания в тексте |
-| `get_top_authors` | Активные авторы и их доля сообщений в выборке |
-| `get_top_posts` | Публикации по сохранённым просмотрам, пересылкам или реакциям |
-| `get_reply_partners` | Кому пользователь чаще отвечает и кто отвечает ему |
-| `compare_periods` | Сравнение показателей двух периодов и, опционально, частоты слов |
-| `get_archive_coverage` | Доступные периоды, источники данных и отсутствующие reply targets |
-| `archive_status` | Состояние сборщика, ошибки, объём архива, очередь индексации и импорт |
+| `search` | Main search: FULLTEXT + semantics, deduplicated merging, filters, and explicit warnings |
+| `search_messages` | Search by words or substring, chat, author, dates, and topic; pagination |
+| `semantic_search` | Semantic search with filters and index coverage metrics |
+| `list_users` | Current profiles: ID, username, name, and bio |
+| `list_chats` | List and metadata of archived groups and channels |
+| `get_message` | Message, surrounding context, reply, media file_id, and sources |
+| `get_user_history` | Current profile and combined history of names, usernames, and bios |
+| `get_message_history` | Current message text and saved edit versions |
+| `get_message_metrics` | History of observed views, forwards, and reactions |
+| `get_statistics` | Message, author, reply, edit, and media counts, and text length |
+| `get_activity` | Hourly, daily, weekly, and monthly activity with timezone support |
+| `get_top_words` | Top words: occurrences, message counts, and examples; optional Russian lemmatization |
+| `get_top_phrases` | Top phrases of 2–5 consecutive words |
+| `get_top_mentions` | Frequent literal @mentions in text |
+| `get_top_authors` | Active authors and their share of messages in the sample |
+| `get_top_posts` | Posts ranked by saved views, forwards, or reactions |
+| `get_reply_partners` | Whom a user replies to most often and who replies to them |
+| `compare_periods` | Compare metrics for two periods and, optionally, word frequencies |
+| `get_archive_coverage` | Available periods, data sources, and missing reply targets |
+| `archive_status` | Collector status, errors, archive size, indexing queue, and import |
 
-[Параметры аналитики, фильтры и ограничения →](docs/analytics.md) ·
-[Подключение MCP и настройка доступа →](docs/operations.md#mcp-только-для-чтения)
+[Analytics parameters, filters, and limitations →](docs/analytics.md) ·
+[MCP connection and access setup →](docs/operations.md#mcp-только-для-чтения)
 
-Статистика относится к доступному архиву. При анализе проверяй период, `truncated`
-и покрытие; снимки профиля и метрик отражают только наблюдённые состояния.
+Statistics describe the available archive. When analyzing it, check the period, `truncated`,
+and coverage; profile and metric snapshots reflect only observed states.
 
-## Запуск
+## Getting started
 
-Нужны Python 3.12–3.14, uv и MySQL 8. Подготовь базу и отдельные учётные записи
-для записи и чтения, примени миграции из `sql/`, затем заполни локальный `.env`.
-Для первой авторизации в интерактивном терминале:
+Requires Python 3.12–3.14, uv, and MySQL 8. Prepare the database and separate accounts
+for writing and reading, apply the migrations in `sql/`, then fill in the local `.env`.
+For initial authentication in an interactive terminal:
 
 ```bash
 git clone https://github.com/SkrudjReal/tg-message-collector.git
 cd tg-message-collector
 uv sync --frozen
 cp .env.example .env
-# Заполни .env перед авторизацией; не публикуй его.
+# Fill in .env before authenticating; do not publish it.
 uv run python3 app.py login-qr
 uv run python3 app.py run
 ```
 
-QR сканируется в Telegram на телефоне: Настройки → Устройства → Подключить устройство.
-Если включена 2FA, пароль вводится только в терминале. Обычный вход по коду: `app.py login`.
-Собираются только группы, супергруппы/форумы и каналы; личные чаты и Saved Messages исключены.
-`CHAT_IDS` в `.env` ограничивает их список. Старые сообщения и переписка за время простоя
-не запрашиваются обычным сборщиком. Отдельная команда разового импорта требует явных
-целей и даты начала — [порядок запуска](docs/operations.md#разовый-импорт-истории-каналов).
-Медиа не скачиваются: MCP возвращает сохранённые file IDs.
-Ранее записанные данные остаются в архиве; экспорты чатов будут добавлены пользователем отдельно.
+Scan the QR code in Telegram on your phone: Settings → Devices → Link Desktop Device.
+If 2FA is enabled, enter the password only in the terminal. Standard code-based login: `app.py login`.
+Only groups, supergroups/forums, and channels are collected; private chats and Saved Messages are excluded.
+`CHAT_IDS` in `.env` restricts this list. The regular collector does not fetch old messages
+or conversations from downtime. A separate one-time import command requires explicit
+targets and a start date — [startup procedure](docs/operations.md#разовый-импорт-истории-каналов).
+Media is not downloaded: MCP returns saved file IDs.
+Previously recorded data remains in the archive; chat exports will be added separately by the user.
 
-[MCP, индексы, ограничения, тесты и установка на другом хосте →](docs/operations.md)
+[MCP, indexes, limitations, tests, and installation on another host →](docs/operations.md)
 
-Основа: [SkrudjReal/single-pyrouserbot-example](https://github.com/SkrudjReal/single-pyrouserbot-example),
-commit `549dc7b`. Удалены неиспользуемые demo ping / Redis / scheduler;
-сохранены Kurigram, асинхронный MySQL и точка входа `app.py`. Исходный remote сохранён как `template`.
-Сессии, credentials, данные MySQL и личные списки каналов остаются локальными и исключены из Git.
+Based on: [SkrudjReal/single-pyrouserbot-example](https://github.com/SkrudjReal/single-pyrouserbot-example),
+commit `549dc7b`. Unused demo ping / Redis / scheduler components were removed;
+Kurigram, asynchronous MySQL, and the `app.py` entry point were retained. The original remote is kept as `template`.
+Sessions, credentials, MySQL data, and personal channel lists remain local and are excluded from Git.
